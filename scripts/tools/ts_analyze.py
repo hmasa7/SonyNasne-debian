@@ -18,12 +18,23 @@ for i in range(n):
             if c!=cc[pid]: ccerr[pid]+=1   # 重複(同じ値)は許容
         cc[pid]=c
 # PAT/PMT をパース
-def first_section(pid):
+def payload(p):
+    afc=(p[3]>>4)&3
+    return p[4+((1+p[4]) if afc&2 else 0):] if afc&1 else b""
+def first_section(pid):   # 1 パケットに収まらないセクション(ES の多い PMT など)は、続きのパケットをつなげる
+    sec=None
     for i in range(n):
         p=d[i*188:i*188+188]
-        if p[0]==0x47 and (((p[1]&0x1f)<<8)|p[2])==pid and p[1]&0x40:
-            afc=(p[3]>>4)&3; o=4+((1+p[4]) if afc&2 else 0); o+=1+p[o]
-            ln=((p[o+1]&0xf)<<8)|p[o+2]; return p[o:o+3+ln]
+        if p[0]!=0x47 or (((p[1]&0x1f)<<8)|p[2])!=pid: continue
+        if sec is None:
+            if not p[1]&0x40: continue
+            q=payload(p); sec=q[1+q[0]:] if q else b""
+        else:
+            if p[1]&0x40: sec=None; continue      # 途中で次のセクションが始まった(取りこぼし)。次の先頭から読み直す
+            sec+=payload(p)
+        if len(sec)>=3:
+            ln=((sec[1]&0xf)<<8)|sec[2]
+            if len(sec)>=3+ln: return sec[:3+ln]
     return None
 pat=first_section(0)
 pm={}

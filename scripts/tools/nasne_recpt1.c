@@ -444,6 +444,9 @@ static void set(unsigned long off, unsigned long v) { ob_sec[off / 4] = v; }
 /* 試験用(--reuse-test N): GENERIC ストリーム(ACTIVATE 済み)を閉じずに、次の選局で OPEN_SECUREDTS だけをやり直す。
  * ACTIVATE(毎回約 419ms)を省けるか、使い回しても復号できるかを確かめる。コマンドラインのときだけ */
 static unsigned long reuse_n, reuse_alt_freq, reuse_alt_tsid, reuse_alt_sid;
+/* 試験用: --hold-generic は GENERIC を開いて ACTIVATE し、ハンドルを表示して SIGTERM まで持ち続ける。
+ * --use-generic <h0>,<h1> は、そのハンドルを使って(自分では ACTIVATE せず、閉じもせずに)受信する。別のプロセスから使えるかの確認用 */
+static unsigned long ext_g0, ext_g1; static int hold_generic;
 #define LOCK_BCAS	"/tmp/nasne-recpt1-bcas.lock"
 static long bcas_lockfd = -1;
 static void bcas_lock(void) {
@@ -467,9 +470,9 @@ static int open_streams(struct svc *s, int is_sat) {
     if (r < 0) bcas_unlock();      /* 成功時は、最初の映像/音声のパケットが出るまで(最大 BCAS_HOLD_MS)ロックを持ち続ける(session() で解放) */
     return r;
 }
-static int open_streams_inner(struct svc *s, int is_sat) {
+/* B-CAS の GENERIC ストリームを開いて ACTIVATE し、ACTIVATED イベントを待つ。h_g0/h_g1 に入れる */
+static int bcas_open_activate(void) {
     unsigned long rv, i; int tries;
-    if (reuse_n && (h_g0 || h_g1)) { lgx("bcas generic reused", h_g0); goto secured; }     /* 試験用: ACTIVATE 済みの GENERIC を使い回す */
     /* B-CAS ジェネリックストリーム */
     clr(ob_g, 0x208 / 4 + 2); ob_g[0xac / 4] = 0x400; ob_g[0xb0 / 4] = 0x1000;
     rv = ioc(ob_g, 0x208, 0x2e, 2000);
@@ -498,7 +501,13 @@ static int open_streams_inner(struct svc *s, int is_sat) {
     }
     lgx("bcas activated event tries", (unsigned long)tries);
     if (!i) err("警告: B-CAS活性化イベントを確認できないまま続行\n");
-secured:
+    return 0;
+}
+static int open_streams_inner(struct svc *s, int is_sat) {
+    unsigned long rv;
+    if (ext_g0 || ext_g1) { h_g0 = ext_g0; h_g1 = ext_g1; lgx("bcas generic external", h_g0); }   /* 試験用: 別のプロセスが ACTIVATE した GENERIC を使う */
+    else if (reuse_n && (h_g0 || h_g1)) lgx("bcas generic reused", h_g0);     /* 試験用: ACTIVATE 済みの GENERIC を使い回す */
+    else if (bcas_open_activate() < 0) return -1;
     /* 復号ストリーム: 純正の既定値(映像パススルー設定)+番組ごとのPID */
     int na = s->num_audio > 0 ? s->num_audio : 1;
     int a;
@@ -542,6 +551,7 @@ static void close_streams_ex(int keep_g) {
     lgx("close_streams: pt", h_pt0);
     if (h_pt0 || h_pt1) { clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = h_pt0; tb[0xa8 / 4] = h_pt1; ioc(tb, 0xb4, 0x11, 5000); h_pt0 = h_pt1 = 0; }
     lgx("close_streams: generic", h_g0);
+    if (ext_g0 || ext_g1) { h_g0 = h_g1 = 0; return; }       /* 試験用: 別のプロセスの GENERIC は閉じない */
     if (!keep_g && (h_g0 || h_g1)) { clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = h_g0; tb[0xa8 / 4] = h_g1; tb[0xb0 / 4] = 0x400; ioc(tb, 0xb4, 0x2f, 5000); h_g0 = h_g1 = 0; }
 }
 static void close_streams(void) { close_streams_ex(0); }
@@ -1437,6 +1447,13 @@ int main_c(long *sp) {
         else if (streq(a, "--dual-tuner")) dual_mode = 1;       /* 地デジと衛星を同時に使う(試験的)。既定は従来どおり1系統 */
         else if (streq(a, "--reuse-test") && ai + 1 < argc) { reuse_n = parse_dec(argv[++ai]); logv = 1; }     /* 試験用 */
         else if (streq(a, "--reuse-alt") && ai + 1 < argc) { int sat; if (!parse_channel_str(argv[++ai], &sat, &reuse_alt_freq, &reuse_alt_tsid)) reuse_alt_freq = 0; }
+        else if (streq(a, "--hold-generic")) hold_generic = 1;
+        else if (streq(a, "--use-generic") && ai + 1 < argc) {      /* <h0>,<h1>(16進。--hold-generic の表示のまま) */
+            const char *v = argv[++ai]; char h[2][12]; int j = 0, k = 0;
+            for (; *v && j < 2; v++) { if (*v == ',') { h[j][k] = 0; j++; k = 0; } else if (k < 11) h[j][k++] = *v; }
+            if (j < 2) h[j][k] = 0;
+            if (j == 1) { ext_g0 = parse_hex(h[0]); ext_g1 = parse_hex(h[1]); logv = 1; }
+        }
         else if (streq(a, "--reuse-alt-sid") && ai + 1 < argc) { const char *v = argv[++ai]; reuse_alt_sid = (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) ? parse_hex(v + 2) : parse_dec(v); }
         else if (streq(a, "--device") || streq(a, "--lnb") || streq(a, "--udp") || streq(a, "--port") || streq(a, "--http")) ai++;
         else if (a[0] == '-' && a[1] == '-') { /* --b25 --strip 等の recpt1 オプションは無視 */ }
@@ -1444,6 +1461,17 @@ int main_c(long *sp) {
     }
     if (port) { logv = 1; return listen_port(port); }        /* 待ち受け(親)は既定のシグナル動作のまま。各子プロセスがハンドラを設定する */
     set_sig(SIGINT_); set_sig(SIGTERM_); set_sig(SIGPIPE_);
+    if (hold_generic) {     /* 試験用: GENERIC を開いて ACTIVATE し、SIGTERM/SIGINT まで持ち続ける */
+        logv = 1;
+        fd = sys3(SYS_open, (long)"/dev/vixs/xcodedrv", 2, 0);
+        if (fd < 0 || !fw_alive()) { err("ドライバかファームが使えない\n"); return 1; }
+        if (bcas_open_activate() < 0) return 1;
+        err("generic "); errhex(h_g0); err(","); errhex(h_g1); err("\n");
+        while (!term_flag) msleep(200);
+        clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = h_g0; tb[0xa8 / 4] = h_g1; tb[0xb0 / 4] = 0x400;
+        lgx("hold-generic: close rv", ioc(tb, 0xb4, 0x2f, 5000));
+        return 0;
+    }
     if (do_scan) return scan(1, do_scan == 2 ? 1 : do_scan == 3 ? 2 : 0);
     if (npos < 3 - (freq_hz ? 1 : 0)) { err("usage: nasne-recpt1 [--sid N] [--tsid N] [-v] [--dual-tuner] <ch 13-62 | BS1-BS23(奇数。BS15_0 のようにスロット付きも可) | CS2-CS24(偶数) | --freq MHz> <秒数|-> <出力|->\n       nasne-recpt1 --scan [--scan-sat | --scan-all] | --listen <port>\n"); return 2; }
     {

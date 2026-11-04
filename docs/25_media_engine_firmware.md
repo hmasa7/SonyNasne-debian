@@ -166,6 +166,8 @@ dd if=/dev/mem bs=65536 skip=16 count=96 2>/dev/null > me_code.bin             #
   - B-CAS 側のストリームのオブジェクト(`+0x1c` が GENERIC のハンドル。復号ストリームを開くと 1 本ずつできる): 3(番号なし)
 - **○の組み合わせでも ×の組み合わせでも、2 系統で secondary は 22/22**。×の局は、データ放送の ES に ES 単位の CA 記述子があるため 1 個多く要り、取れない。
 - 減らせないか試したもの(どれも 11 のまま): `emm_pid`(`0x17c`)= `0x1fff`、`remux_flags` の `PSI_TABLE_INTERVAL` を外す・`REMOVE_PSI_INSERTION` を足す、`program_mode_flags` = `0x1c0`、ユーザー側 `0x138` = 0、`0x204`(ECM の PID の欄)= `0x1fff`。
+- **PSI ストリーム(ioctl `0x2d`)の絞り込みの欄**も試した(どれも 12 のまま。地デジ 25ch 1 本)。ユーザー側の位置は、実機の `xcode4drv.ko` の `txc_open_psi_dev` から求めた: `mode` `0xb0`(`SDEV_PID_FILTER` = `0x80`)、`src` `0xbc`、`ts_passthrough_pid` `0xc8`、`num_ts_passthrough_pid` `0xe4`・`psi_pid[32]` `0xe8`〜、`num_ts_passthrough_table` `0x168`・`psi_table_id[16]` `0x16c`〜、`program_number` `0x1ac`、`use_program_number` `0x480`。
+  - PID を PAT・PMT だけにする、PID フィルタ(`0x80`)、テーブル ID を PAT だけにする、番組番号を指定する: どれも secondary は 12 のままで、**PSI ストリームの出力(EIT など)も変わらなかった**。この使い方では効いていないとみられる。復号ストリームは自分のチャンネル(番号 1)で PMT を読んでいるとみられる(推測)。
 - PSI ストリームを、復号ストリームを開いた直後に閉じると(`nasne-recpt1 --dbg-close-pt`)、**復号ストリームが何も出さなくなる**(1 本だけでも 0 バイト)。復号ストリームは PSI ストリームを入力にしているので、閉じられない。
 - 直すには、ファームの定数(secondary の個数)を変えるしかないとみられる(未試験。ファームはドライバの中にあり、書き換えたドライバを読み込み直す必要がある。プールの後ろの領域や、プールごとのメモリ `0x6adfec` = `0x5e000` との関係は未確認)。
 

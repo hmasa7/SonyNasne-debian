@@ -454,6 +454,7 @@ static unsigned long reuse_n, reuse_alt_freq, reuse_alt_tsid, reuse_alt_sid;
 static unsigned long dbg_ecm;      /* 試験用(--dbg-ecm): OPEN_SECUREDTS に渡す ECM の PID を差し替える(Issue #14 の切り分け) */
 static int dbg_raw;
 static int dbg_drain;     /* 試験用(--dbg-drain) */
+static int dbg_close_pt;  /* 試験用(--dbg-close-pt): 復号ストリームを開いた直後に PSI ストリームを閉じる(Issue #14: ファームの資源の切り分け) */
 static unsigned long dbg_keyprobe;  /* 試験用(--dbg-keyprobe N): 復号ストリームを開いた直後に鍵スロット(CMD2_SDEV_RESERVE_KEYSTORE_SLOT 0x114)を 1 個ずつ、
                                      * 失敗するまで最大 N 回確保し、空き数を数える(Issue #14)。解放の命令は無いので、試験の後はドライバを読み込み直すこと */
 static unsigned long giveup_ms;   /* --giveup-no-av <ms>: 2系統同時で、この時間映像/音声が出なければセッションを打ち切る(Issue #14。0=無効) */
@@ -1089,6 +1090,10 @@ again:
     }
     lgx("open_streams begin", 0);
     if (open_streams(s, is_sat) < 0) { if (http) http_status(ofd, "HTTP/1.0 500 Internal Server Error", "secured stream\n"); close_streams(); release_tuner(); return 1; }
+    if (dbg_close_pt && (h_pt0 || h_pt1)) {
+        clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = h_pt0; tb[0xa8 / 4] = h_pt1;
+        lgx("dbg: PSI ストリームを閉じた rv", ioc(tb, 0xb4, 0x11, 5000)); h_pt0 = h_pt1 = 0;
+    }
     lgx("streaming begin", 0);
     if (http) send_headers(ofd);
     t_start = now_ms(); scr_cnt = 0; nto = 0;
@@ -1137,7 +1142,7 @@ again:
         } else { err("RECV エラー rv="); errhex(rv); err("\n"); break; }
         {   /* SI(NIT/SDT/EIT/TOT 等)およびPMTをPSIストリームから混ぜる */
             unsigned char *p; unsigned long psz; int m = 0;
-            while (recv_pt(1, &p, &psz)) {      /* --dbg-drain: 溜まっている分を全部読む(試験用。PSI ストリームが詰まって入力が止まるかの切り分け) */
+            while ((h_pt0 || h_pt1) && recv_pt(1, &p, &psz)) {      /* --dbg-drain: 溜まっている分を全部読む(試験用。PSI ストリームが詰まって入力が止まるかの切り分け) */
                 for (k = 0; k + 188 <= psz; k += 188)
                     if (p[k] == 0x47 && is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2])) put_pkt(p + k);
                 if (!dbg_drain || ++m >= 16) break;
@@ -1629,6 +1634,7 @@ int main_c(long *sp) {
         else if (streq(a, "--hold-generic")) hold_generic = 1;
         else if (streq(a, "--si")) si_only = 1;
         else if (streq(a, "--dbg-drain")) { dbg_drain = 1; logv = 1; }
+        else if (streq(a, "--dbg-close-pt")) { dbg_close_pt = 1; logv = 1; }
         else if (streq(a, "--dbg-keyprobe") && ai + 1 < argc) { dbg_keyprobe = parse_dec(argv[++ai]); logv = 1; }
         else if (streq(a, "--dbg-sec") && ai + 1 < argc && dbg_sec_n < DBG_MAX) { if (dbg_parse(argv[++ai], &dbg_sec_off[dbg_sec_n], &dbg_sec_val[dbg_sec_n])) dbg_sec_n++; logv = 1; }
         else if (streq(a, "--dbg-pt") && ai + 1 < argc && dbg_pt_n < DBG_MAX) { if (dbg_parse(argv[++ai], &dbg_pt_off[dbg_pt_n], &dbg_pt_val[dbg_pt_n])) dbg_pt_n++; logv = 1; }

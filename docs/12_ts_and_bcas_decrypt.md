@@ -77,7 +77,20 @@
 | `+0x100` / `+0x110` | `in_audio_pid[0]` / `out_audio_pid[0]`(同じ値) |
 | `+0x13c` | `pcr_pid` |
 | `+0x160` / `+0x194` | `out_program_number` / `program_number`(サービスID) |
-| `+0x178` | `ecm_pid`(PMTのプログラム記述子で CA_system_id=5 の PID) |
+| `+0x178` | `ecm_pid`(PMTのプログラム記述子で CA_system_id=5 の PID)。ファームは自分で PMT から ECM を読むようで、違う値を入れても結果は変わらなかった(Issue #14 の試験) |
+| `+0x17c` | `emm_pid` |
+| `+0x180` | `xcode_key_index` |
+| `+0x184` | `input_encrypt_mode`(1 = B-CAS) |
+| `+0x188` | `output_encrypt_mode`(0) |
+| `+0x18c` / `+0x190` | `program_index` / `ltsid` |
+| `+0x198` | `ca_pmt_command_id` |
+| `+0x19c` | `securedts_mode` |
+
+`+0x17c`〜`+0x198` は、ファームの構造体の並び(SDK の `mipshost.h`)と既知の 4 欄(`+0x178`・`+0x184`・`+0x194`・`+0x19c`)の位置から決めた([docs/25](25_media_engine_firmware.md))。
+`program_number`(`+0x194`)はファームが実際の番組と照合していて、別の値を入れると何も出力されない。`numOfDecrypter`(割り当てた復号器の数)は、Linux 版のドライバではユーザー側に書き戻されない。
+
+| offset | 内容(続き) |
+|---|---|
 | `+0x1a0` | `num_scrambled_pid` = 2 |
 | `+0x1a4`〜 | `scrambled_es_pid[]` = [映像PID, 音声PID] |
 | `+0x204`〜 | `scrambled_ecm_pid[]` = [ECM, ECM] |

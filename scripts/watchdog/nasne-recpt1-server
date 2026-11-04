@@ -20,6 +20,8 @@ PORT=${NASNE_RECPT1_PORT:-8301}
 OPTS=""; [ "$NASNE_RECPT1_DUAL" = 1 ] && OPTS="--dual-tuner"
 # B-CAS の GENERIC ストリームを 1 つにして共有し、選局ごとの ACTIVATE(約 500ms)を省く(試験的。docs/11)には NASNE_RECPT1_SHARED=1
 [ "$NASNE_RECPT1_SHARED" = 1 ] && OPTS="$OPTS --shared-generic"
+# 2系統の同時受信で、局の組み合わせによって後発の映像が出ないとき(Issue #14)、この時間(ms)でセッションを打ち切ってチューナーを解放する(例: 6000)。既定は無効
+[ -n "$NASNE_RECPT1_GIVEUP_MS" ] && OPTS="$OPTS --giveup-no-av $NASNE_RECPT1_GIVEUP_MS"
 PIDFILE=/var/run/nasne-recpt1-server.pid
 case "$1" in
   start)

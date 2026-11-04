@@ -451,6 +451,24 @@ static void set(unsigned long off, unsigned long v) { ob_sec[off / 4] = v; }
 /* 試験用(--reuse-test N): GENERIC ストリーム(ACTIVATE 済み)を閉じずに、次の選局で OPEN_SECUREDTS だけをやり直す。
  * ACTIVATE(毎回約 419ms)を省けるか、使い回しても復号できるかを確かめる。コマンドラインのときだけ */
 static unsigned long reuse_n, reuse_alt_freq, reuse_alt_tsid, reuse_alt_sid;
+static unsigned long dbg_ecm;      /* 試験用(--dbg-ecm): OPEN_SECUREDTS に渡す ECM の PID を差し替える(Issue #14 の切り分け) */
+static int dbg_raw;
+static int dbg_drain;     /* 試験用(--dbg-drain) */
+static unsigned long dbg_keyprobe;  /* 試験用(--dbg-keyprobe N): 復号ストリームを開いた直後に鍵スロット(CMD2_SDEV_RESERVE_KEYSTORE_SLOT 0x114)を 1 個ずつ、
+                                     * 失敗するまで最大 N 回確保し、空き数を数える(Issue #14)。解放の命令は無いので、試験の後はドライバを読み込み直すこと */
+static unsigned long giveup_ms;   /* --giveup-no-av <ms>: 2系統同時で、この時間映像/音声が出なければセッションを打ち切る(Issue #14。0=無効) */
+/* 試験用(--dbg-sec / --dbg-pt <オフセット>=<値>): OPEN_SECUREDTS・PSI ストリームの構造体の欄を、ioctl の直前に上書きする(Issue #14 の切り分け) */
+#define DBG_MAX 8
+static unsigned long parse_dec(const char *s);
+static unsigned long dbg_sec_off[DBG_MAX], dbg_sec_val[DBG_MAX], dbg_pt_off[DBG_MAX], dbg_pt_val[DBG_MAX]; static int dbg_sec_n, dbg_pt_n;
+static int dbg_parse(const char *v, unsigned long *off, unsigned long *val) {
+    char a[16]; int i = 0;
+    while (*v && *v != '=' && i < 15) a[i++] = *v++;
+    a[i] = 0; if (*v++ != '=') return 0;
+    *off = (a[0] == '0' && (a[1] | 32) == 'x') ? parse_hex(a + 2) : parse_dec(a);
+    *val = (v[0] == '0' && (v[1] | 32) == 'x') ? parse_hex(v + 2) : parse_dec(v);
+    return 1;
+}      /* 試験用(--dbg-raw): SI だけの配信(--si)で、PSI ストリームの全 PID を出す(TS の PID の一覧を取る。Issue #14) */
 /* 試験用: --hold-generic は GENERIC を開いて ACTIVATE し、ハンドルを表示して SIGTERM まで持ち続ける。
  * --use-generic <h0>,<h1> は、そのハンドルを使って(自分では ACTIVATE せず、閉じもせずに)受信する。別のプロセスから使えるかの確認用 */
 static unsigned long ext_g0, ext_g1; static int hold_generic;
@@ -617,6 +635,7 @@ static int open_streams_inner(struct svc *s, int is_sat) {
     set(0x608, 0x21); set(0x67c, 0x10000); set(0x698, 0x30000); set(0x894, 0xc); set(0x898, 0x5b8d80); set(0x8a8, 0x2ee00); set(0x8ac, 0xbb80);
     set(0x8b0, 2); set(0x8b4, 0x400); set(0x924, 2); set(0x940, 0xf03); set(0x950, 0x1e8480); set(0x954, 2); set(0x958, 3);
     set(0x964, 0x1e8480); set(0x968, 2); set(0x96c, 3); set(0x978, 1); set(0x980, 2);
+    { int j; for (j = 0; j < dbg_sec_n; j++) { ob_sec[dbg_sec_off[j] / 4] = dbg_sec_val[j]; lgx("dbg: sec 上書き off", dbg_sec_off[j]); lgx("dbg: sec 上書き val", dbg_sec_val[j]); } }
     rv = ioc(ob_sec, 0x9ec, 0x30, 2000);
     lgx("open_streams SECUREDTS rv", rv);
     if (rv != 1) { err("復号ストリーム(OPEN_SECUREDTS)を開けない rv="); errhex(rv); err("\n"); 
@@ -624,6 +643,29 @@ static int open_streams_inner(struct svc *s, int is_sat) {
         return -1;
     }
     h_sec0 = ob_sec[0xa4 / 4]; h_sec1 = ob_sec[0xa8 / 4];
+    if (dbg_keyprobe) {     /* 自分のストリームのハンドルだけを使う(ドライバはハンドルを検証せずに参照するので、他の値は渡さない) */
+        unsigned long n, krv, first = 0xffffffff, last = 0;
+        for (n = 0; n < dbg_keyprobe; n++) {
+            clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = h_sec0; tb[0xa8 / 4] = h_sec1; tb[0xac / 4] = 1; tb[0xb0 / 4] = 0;
+            krv = ioc(tb, 0xb4, 0x114, 2000);
+            if (krv != 1) { lgx("keyprobe: 確保に失敗 rv", krv); break; }
+            if (first == 0xffffffff) first = tb[0xb0 / 4];
+            last = tb[0xb0 / 4];
+        }
+        lgx("keyprobe: 確保できた数", n); lgx("keyprobe: 最初の番号", first); lgx("keyprobe: 最後の番号", last);
+        if (n == 0) {       /* 失敗したら、値とハンドルを変えて 1 回ずつ試す(どの組み合わせなら受け付けるか) */
+            static const unsigned long cnt[3] = { 1, 2, 4 }, hint[3] = { 0, 64, 0xffffffff };
+            unsigned long hh[3][2]; int hi, ci, ki;
+            hh[0][0] = h_sec0; hh[0][1] = h_sec1; hh[1][0] = h_pt0; hh[1][1] = h_pt1; hh[2][0] = h_g0; hh[2][1] = h_g1;
+            for (hi = 0; hi < 3; hi++) for (ci = 0; ci < 3; ci++) for (ki = 0; ki < 3; ki++) {
+                if (!(hh[hi][0] || hh[hi][1])) continue;
+                clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = hh[hi][0]; tb[0xa8 / 4] = hh[hi][1]; tb[0xac / 4] = cnt[ci]; tb[0xb0 / 4] = hint[ki];
+                krv = ioc(tb, 0xb4, 0x114, 2000);
+                lgx("keyprobe2: handle(0=sec,1=pt,2=generic)", hi); lgx("keyprobe2:  slots", cnt[ci]); lgx("keyprobe2:  hint", hint[ki]);
+                lgx("keyprobe2:  rv", krv); lgx("keyprobe2:  KeyIndex", tb[0xb0 / 4]);
+            }
+        }
+    }
     return 0;
 }
 static void close_streams_ex(int keep_g) {
@@ -1005,6 +1047,7 @@ again:
     }
     clr(ob_pt, 0x484 / 4 + 2);
     ob_pt[0xac / 4] = 0x800000; ob_pt[0xbc / 4] = is_sat ? 1 : 0; ob_pt[0xc8 / 4] = 0xffff; ob_pt[0xd0 / 4] = 0x10000;
+    { int j; for (j = 0; j < dbg_pt_n; j++) { ob_pt[dbg_pt_off[j] / 4] = dbg_pt_val[j]; lgx("dbg: pt 上書き off", dbg_pt_off[j]); lgx("dbg: pt 上書き val", dbg_pt_val[j]); } }
     if (ioc(ob_pt, 0x484, 0x2d, 2000) != 1) { err("PSIストリームを開けない\n"); if (http) http_status(ofd, "HTTP/1.0 500 Internal Server Error", "psi stream\n"); release_tuner(); return 1; }
     h_pt0 = ob_pt[0xa4 / 4]; h_pt1 = ob_pt[0xa8 / 4];
     lgx("psi stream opened", h_pt0);
@@ -1019,7 +1062,7 @@ again:
             if (recv_pt(200, &p, &psz)) {
                 nt = 0;
                 for (k = 0; k + 188 <= psz; k += 188)
-                    if (p[k] == 0x47 && is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2])) put_pkt(p + k);
+                    if (p[k] == 0x47 && (dbg_raw || is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2]))) put_pkt(p + k);
             } else if (++nt > 100) { err("出力が止まった\n"); break; }
             if (olen) flush_out();
         }
@@ -1034,6 +1077,8 @@ again:
     if (sel < 0) { err("サービスが見つからない\n"); if (http) http_status(ofd, "HTTP/1.0 404 Not Found", "service not found\n"); close_streams(); release_tuner(); return 1; }
     s = &svcs[sel];
     lgx("discover found num_audio", (unsigned long)s->num_audio);
+    lgx("discover ecm", s->ecm);
+    if (dbg_ecm) { s->ecm = dbg_ecm; lgx("dbg: ecm を差し替えた", dbg_ecm); }
     if (verbose) {
         int a;
         err("サービス 0x"); errhex(s->pn); err(" video 0x"); errhex(s->vpid);
@@ -1061,6 +1106,12 @@ again:
             }
         }
         if (bcas_lockfd >= 0 && now_ms() - t_start >= BCAS_HOLD_MS) { lgx("bcas lock released by timeout", 0); bcas_unlock(); }
+        /* Issue #14: 2系統の同時受信で、地デジの局によっては後発の復号が始まらない(映像・音声が出ない)。
+         * giveup_ms を超えても最初の映像/音声が来ず、かつ もう一方の系統が使用中なら、このセッションを打ち切る
+         * (チューナーを解放し、録画ソフトが別チューナーへ移れるようにする。原因は未解明。局の組み合わせで決まる) */
+        if (giveup_ms && !av_first && dual_mode && now_ms() - t_start >= giveup_ms && other_band_busy(is_sat)) {
+            err("同時受信で映像・音声が出ないため打ち切る(Issue #14)\n"); break;
+        }
         if (dur_ms && now_ms() - t_start >= dur_ms) break;
         clr(rb, 0x230 / 4);
         rb[0xa4 / 4] = h_sec0; rb[0xa8 / 4] = h_sec1; rb[0xac / 4] = 0x2000; rb[0xbc / 4] = 0x10000; rb[0x144 / 4] = prev_sec;
@@ -1085,9 +1136,12 @@ again:
             if (++nto > 100) { err("出力が止まった\n"); break; }          /* 約20秒 */
         } else { err("RECV エラー rv="); errhex(rv); err("\n"); break; }
         {   /* SI(NIT/SDT/EIT/TOT 等)およびPMTをPSIストリームから混ぜる */
-            unsigned char *p; unsigned long psz;
-            if (recv_pt(1, &p, &psz)) for (k = 0; k + 188 <= psz; k += 188)
-                if (p[k] == 0x47 && is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2])) put_pkt(p + k);
+            unsigned char *p; unsigned long psz; int m = 0;
+            while (recv_pt(1, &p, &psz)) {      /* --dbg-drain: 溜まっている分を全部読む(試験用。PSI ストリームが詰まって入力が止まるかの切り分け) */
+                for (k = 0; k + 188 <= psz; k += 188)
+                    if (p[k] == 0x47 && is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2])) put_pkt(p + k);
+                if (!dbg_drain || ++m >= 16) break;
+            }
         }
         if (olen) flush_out();
     }
@@ -1568,10 +1622,18 @@ int main_c(long *sp) {
         else if (streq(a, "--scan-all")) do_scan = 3;
         else if (streq(a, "-v")) verbose = 1;
         else if (streq(a, "--dual-tuner")) dual_mode = 1;       /* 地デジと衛星を同時に使う(試験的)。既定は従来どおり1系統 */
+        else if (streq(a, "--giveup-no-av") && ai + 1 < argc) giveup_ms = parse_dec(argv[++ai]);   /* Issue #14: 同時受信で映像が出ないとき打ち切るまでのms */
         else if (streq(a, "--reuse-test") && ai + 1 < argc) { reuse_n = parse_dec(argv[++ai]); logv = 1; }     /* 試験用 */
         else if (streq(a, "--reuse-alt") && ai + 1 < argc) { int sat; if (!parse_channel_str(argv[++ai], &sat, &reuse_alt_freq, &reuse_alt_tsid)) reuse_alt_freq = 0; }
         else if (streq(a, "--shared-generic")) shared_generic = 1;     /* GENERIC を 1 つにして閉じずに共有する(--listen のとき。docs/11) */
         else if (streq(a, "--hold-generic")) hold_generic = 1;
+        else if (streq(a, "--si")) si_only = 1;
+        else if (streq(a, "--dbg-drain")) { dbg_drain = 1; logv = 1; }
+        else if (streq(a, "--dbg-keyprobe") && ai + 1 < argc) { dbg_keyprobe = parse_dec(argv[++ai]); logv = 1; }
+        else if (streq(a, "--dbg-sec") && ai + 1 < argc && dbg_sec_n < DBG_MAX) { if (dbg_parse(argv[++ai], &dbg_sec_off[dbg_sec_n], &dbg_sec_val[dbg_sec_n])) dbg_sec_n++; logv = 1; }
+        else if (streq(a, "--dbg-pt") && ai + 1 < argc && dbg_pt_n < DBG_MAX) { if (dbg_parse(argv[++ai], &dbg_pt_off[dbg_pt_n], &dbg_pt_val[dbg_pt_n])) dbg_pt_n++; logv = 1; }
+        else if (streq(a, "--dbg-raw")) { dbg_raw = 1; si_only = 1; }
+        else if (streq(a, "--dbg-ecm") && ai + 1 < argc) { const char *v = argv[++ai]; dbg_ecm = (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) ? parse_hex(v + 2) : parse_dec(v); logv = 1; }
         else if (streq(a, "--use-generic") && ai + 1 < argc) {      /* <h0>,<h1>(16進。--hold-generic の表示のまま) */
             const char *v = argv[++ai]; char h[2][12]; int j = 0, k = 0;
             for (; *v && j < 2; v++) { if (*v == ',') { h[j][k] = 0; j++; k = 0; } else if (k < 11) h[j][k++] = *v; }

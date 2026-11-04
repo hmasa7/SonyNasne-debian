@@ -18,6 +18,8 @@ BIN=/usr/local/sbin/nasne-recpt1
 PORT=${NASNE_RECPT1_PORT:-8301}
 # 地デジと衛星(BS/CS)を同時に使う(試験的。既定は従来どおり1系統)には、/etc/default/nasne-recpt1 に NASNE_RECPT1_DUAL=1 と書いて restart
 OPTS=""; [ "$NASNE_RECPT1_DUAL" = 1 ] && OPTS="--dual-tuner"
+# B-CAS の GENERIC ストリームを 1 つにして共有し、選局ごとの ACTIVATE(約 500ms)を省く(試験的。docs/11)には NASNE_RECPT1_SHARED=1
+[ "$NASNE_RECPT1_SHARED" = 1 ] && OPTS="$OPTS --shared-generic"
 PIDFILE=/var/run/nasne-recpt1-server.pid
 case "$1" in
   start)

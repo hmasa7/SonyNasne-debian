@@ -320,6 +320,8 @@ GENERIC を 1 つにして閉じずに共有する作りにすれば、①選局
 
 ```bash
 nasne-recpt1 --listen 8301 --shared-generic                # 2 系統なら --dual-tuner も
+# サービス(scripts/watchdog/nasne-recpt1-server)で有効にする
+echo NASNE_RECPT1_SHARED=1 >> /etc/default/nasne-recpt1 && /etc/init.d/nasne-recpt1-server restart
 ```
 
 - 親が、起動時(と各接続の前)に自分の fd で GENERIC を開いて ACTIVATE し、fd ごと持ち続ける。ハンドル・親の PID・世代を `/tmp/nasne-recpt1-generic` に書く。

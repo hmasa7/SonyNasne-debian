@@ -441,6 +441,9 @@ static void set(unsigned long off, unsigned long v) { ob_sec[off / 4] = v; }
  * 後のセッションが先に ACTIVATE すると、カードが忙しくて rv=2 で失敗し、その再試行が連続して、先着側の最初の ECM の応答まで
  * 遅らせて、両方の立ち上がりが遅れる(共倒れ。Issue #12 の monutetsu さんの解析)ため。 */
 #define BCAS_HOLD_MS	4000
+/* 試験用(--reuse-test N): GENERIC ストリーム(ACTIVATE 済み)を閉じずに、次の選局で OPEN_SECUREDTS だけをやり直す。
+ * ACTIVATE(毎回約 419ms)を省けるか、使い回しても復号できるかを確かめる。コマンドラインのときだけ */
+static unsigned long reuse_n, reuse_alt_freq, reuse_alt_tsid, reuse_alt_sid;
 #define LOCK_BCAS	"/tmp/nasne-recpt1-bcas.lock"
 static long bcas_lockfd = -1;
 static void bcas_lock(void) {
@@ -466,6 +469,7 @@ static int open_streams(struct svc *s, int is_sat) {
 }
 static int open_streams_inner(struct svc *s, int is_sat) {
     unsigned long rv, i; int tries;
+    if (reuse_n && (h_g0 || h_g1)) { lgx("bcas generic reused", h_g0); goto secured; }     /* 試験用: ACTIVATE 済みの GENERIC を使い回す */
     /* B-CAS ジェネリックストリーム */
     clr(ob_g, 0x208 / 4 + 2); ob_g[0xac / 4] = 0x400; ob_g[0xb0 / 4] = 0x1000;
     rv = ioc(ob_g, 0x208, 0x2e, 2000);
@@ -494,6 +498,7 @@ static int open_streams_inner(struct svc *s, int is_sat) {
     }
     lgx("bcas activated event tries", (unsigned long)tries);
     if (!i) err("警告: B-CAS活性化イベントを確認できないまま続行\n");
+secured:
     /* 復号ストリーム: 純正の既定値(映像パススルー設定)+番組ごとのPID */
     int na = s->num_audio > 0 ? s->num_audio : 1;
     int a;
@@ -876,6 +881,8 @@ static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsi
     if (rc == 3) { err("チューナー使用中\n"); if (http) http_status(ofd, "HTTP/1.0 503 Service Unavailable", "tuner busy\n"); return 3; }
     if (rc) { if (http) http_status(ofd, "HTTP/1.0 500 Internal Server Error", "driver/firmware error\n"); release_tuner(); return 1; }
     lgx("tuner acquired", 0);
+    unsigned long reuse_i = 0, scr_cnt, reuse_base_freq = freq_val, reuse_base_tsid = ts_id, reuse_base_sid = want_sid;
+again:
     if (is_sat) {
         if (!fe_tune_s(freq_val, ts_id)) { err("衛星ロックしなかった(信号なし)\n"); if (http) http_status(ofd, "HTTP/1.0 404 Not Found", "no signal\n"); release_tuner(); return 1; }
     } else {
@@ -924,7 +931,7 @@ static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsi
     if (open_streams(s, is_sat) < 0) { if (http) http_status(ofd, "HTTP/1.0 500 Internal Server Error", "secured stream\n"); close_streams(); release_tuner(); return 1; }
     lgx("streaming begin", 0);
     if (http) send_headers(ofd);
-    t_start = now_ms();
+    t_start = now_ms(); scr_cnt = 0; nto = 0;
     {   /* 診断: セッションの開始から、映像/音声の最初のパケットが出るまでの時間を記録する(Issue #12: 同時開始で BS の映像・音声が遅れる件) */
     int av_first = 0;
     while (!stop_flag) {
@@ -941,6 +948,7 @@ static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsi
                 unsigned char *p = (unsigned char *)ob_sec[0x2d4 / 4 + idx];
                 /* want_sid 指定時はファームウェア生成のシングルサービスPAT(PID 0)をそのまま通す */
                 if (p) for (k = 0; k + 192 <= sz; k += 192) if (p[k + 4] == 0x47 && (want_sid || (p[k + 5] & 0x1f) + p[k + 6] != 0)) {
+                    if (reuse_n && (p[k + 7] & 0xc0)) scr_cnt++;
                     if (!av_first) { unsigned long pid2 = ((p[k + 5] & 0x1f) << 8) | p[k + 6]; if (pid2 == s->vpid || (s->num_audio && pid2 == s->apid[0])) { av_first = 1; lgx("first A/V packet, ms since stream start", now_ms() - t_start); lgx("first A/V packet pid", pid2); bcas_unlock(); } }
                     put_pkt(p + k + 4);
                 }
@@ -959,6 +967,17 @@ static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsi
     }
     if (olen) flush_out();
     lgx("loop end stop_flag", (unsigned long)stop_flag);
+    if (reuse_n) lgx("reuse: scrambled packets", scr_cnt);
+    if (reuse_n && reuse_i < reuse_n && !stop_flag) {      /* 試験用: GENERIC を残して、選局からやり直す */
+        close_streams_ex(1); prev_pt = prev_sec = 0xff;
+        reuse_i++;
+        if (reuse_alt_freq && (reuse_i & 1)) { freq_val = reuse_alt_freq; ts_id = reuse_alt_tsid; want_sid = reuse_alt_sid; }     /* 交互の相手は同じ帯域に限る */
+        else if (reuse_alt_freq) { freq_val = reuse_base_freq; ts_id = reuse_base_tsid; want_sid = reuse_base_sid; }
+        session_want_sid = want_sid;
+        lgx("reuse: iteration", reuse_i);
+        lgx("session start freq", freq_val);
+        goto again;
+    }
     session_want_sid = 0;
     if (http && dual_mode) sys3(SYS_close, ofd, 0, 0);       /* クライアントには、ここで配信の終了を伝える(以降の待機は、クライアントから見えない) */
     close_streams_ex(dual_mode);          /* dual のときは、GENERIC を閉じるのを、ほかのセッションがなくなるまで待つ */
@@ -1416,6 +1435,9 @@ int main_c(long *sp) {
         else if (streq(a, "--scan-all")) do_scan = 3;
         else if (streq(a, "-v")) verbose = 1;
         else if (streq(a, "--dual-tuner")) dual_mode = 1;       /* 地デジと衛星を同時に使う(試験的)。既定は従来どおり1系統 */
+        else if (streq(a, "--reuse-test") && ai + 1 < argc) { reuse_n = parse_dec(argv[++ai]); logv = 1; }     /* 試験用 */
+        else if (streq(a, "--reuse-alt") && ai + 1 < argc) { int sat; if (!parse_channel_str(argv[++ai], &sat, &reuse_alt_freq, &reuse_alt_tsid)) reuse_alt_freq = 0; }
+        else if (streq(a, "--reuse-alt-sid") && ai + 1 < argc) { const char *v = argv[++ai]; reuse_alt_sid = (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) ? parse_hex(v + 2) : parse_dec(v); }
         else if (streq(a, "--device") || streq(a, "--lnb") || streq(a, "--udp") || streq(a, "--port") || streq(a, "--http")) ai++;
         else if (a[0] == '-' && a[1] == '-') { /* --b25 --strip 等の recpt1 オプションは無視 */ }
         else if (npos < 3) pos[npos++] = a;

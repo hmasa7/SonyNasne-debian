@@ -259,6 +259,26 @@ curl 'http://<nasne>:8301/status?detail'     # terrestrial=idle satellite=idle �
 3. B-CASストリームを開いて活性化し、`OPEN_SECUREDTS`(純正と同じ設定で、映像はパススルー=変換なし)を開く。ファームがB-CASで復号し、TS化して出力する。
 4. 出力(192バイトのタイムスタンプ付きTS)の先頭4バイトを外す。ファームが作り直すPAT(選んだ1サービス分だけ)は捨てて、PSIストリームの**元のPAT**(NITのPIDを含む。録画ソフトがNITの場所を知るために必要)と、SI(PID 0x10〜0x14、0x23、0x24、0x26〜0x28)を混ぜて出力する。
 
+### 選局から最初の映像までの時間の内訳
+
+> 層: 【CFW共通】(測定は【旧】2.6.29 + Debian 7 の CECH-ZNR2J 2 台。`nasne-recpt1` は同じなので【新】でも同じ見込みだが、未測定)
+
+`--listen` のときのログ(`/var/log/nasne-recpt1.log`)の節目の差から求めた。過去のログ(地デジ 2,453 回・衛星 1,078 回、2 台)の中央値と、ログを細かくした試作での測定(地デジ 1 局、5〜10 回)。単位は ms。
+
+| 段階 | ログの区間 | 地デジ | 衛星 | 備考 |
+|---|---|---|---|---|
+| チューナーの確保 | `session start` → `tuner acquired` | 151 | 65 | 直前のセッションの終了から 300ms 以内なら、その残りを待つ(p90 が約 440ms になるのはこれ) |
+| 選局のロック+PSI ストリーム | `tuner acquired` → `psi stream opened` | 294 | 286 | ロックの確認は 100ms(衛星 50ms)おき |
+| PAT/PMT の収集 | → `discover sel` | 約 250〜300 | 約 145 | `?sid=` を付けると、その PMT が揃った時点で終わる |
+| B-CAS の GENERIC を開く(0x2e) | `open_streams begin` → `bcas generic opened` | 1 | | |
+| **B-CAS の ACTIVATE(0x13)** | → `bcas activate sent` | **419** | | **毎回ほぼ一定**(417〜419)。続けて開いても毎回かかる |
+| ACTIVATED イベントの待ち(0x14) | → `bcas activated event tries` | 80 | | 1 回目で取れる。待たずに進めても復号は正常だった(5 回)が、短縮は 80ms だけなので採用しない |
+| OPEN_SECUREDTS | → `open_streams SECUREDTS rv` | 42 | 42 | |
+| 最初の映像・音声のパケット | `streaming begin` → `first A/V packet` | 約 920 | 約 1,010 | ECM の到着とカードの応答。600〜1,800 とばらつく。コードからは変えられない |
+| **合計** | | **約 2,250** | **約 2,150** | |
+
+- ACTIVATE の 419ms は、ファーム側の処理(カードの初期化と推測。ドライバのソースでは未確認)。短縮するなら、ACTIVATE の回数を減らす(GENERIC ストリームを閉じずに次のセッションで使い回す)しかない。使い回しができるかは未確認。
+
 ## トラブルシュート
 
 | 症状 | 対処 |

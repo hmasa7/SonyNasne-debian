@@ -471,6 +471,7 @@ static int open_streams_inner(struct svc *s, int is_sat) {
     rv = ioc(ob_g, 0x208, 0x2e, 2000);
     if (rv != 1) { err("B-CASストリームを開けない rv="); errhex(rv); err("\n"); return -1; }
     h_g0 = ob_g[0xa4 / 4]; h_g1 = ob_g[0xa8 / 4];
+    lgx("bcas generic opened", h_g0);
     clr(tb, 0x1d0 / 4 + 2);
     tb[0xa4 / 4] = h_g0; tb[0xa8 / 4] = h_g1; tb[0xac / 4] = 0; tb[0xb0 / 4] = 0x10; tb[0xc4 / 4] = (unsigned long)dummy; tb[0xcc / 4] = 0;
     tb[0xd4 / 4] = 0x400; tb[0xd8 / 4] = 1; tb[0xdc / 4] = 1;
@@ -484,12 +485,14 @@ static int open_streams_inner(struct svc *s, int is_sat) {
         rv = ioc(tb, 0x1d0, 0x13, 2000);
     }
     if (rv != 1) { err("B-CAS ACTIVATE失敗 rv="); errhex(rv); err("\n"); return -1; }
+    lgx("bcas activate sent", 0);
     for (tries = 0, i = 0; tries < 6 && !stop_flag; tries++) {                 /* ACTIVATEDイベントを待つ */
         clr(rb, 0x230 / 4);
         rb[0xa4 / 4] = h_g0; rb[0xa8 / 4] = h_g1; rb[0xac / 4] = 0; rb[0xb0 / 4] = 0x10; rb[0xb4 / 4] = (unsigned long)dummy; rb[0xbc / 4] = sizeof(dummy);
         if (ioc(rb, 0x230, 0x14, 1000) == 1 && (rb[0x130 / 4] & 0x400)) { i = 1; break; }
         if (rb[0x130 / 4] & 0x400) { i = 1; break; }
     }
+    lgx("bcas activated event tries", (unsigned long)tries);
     if (!i) err("警告: B-CAS活性化イベントを確認できないまま続行\n");
     /* 復号ストリーム: 純正の既定値(映像パススルー設定)+番組ごとのPID */
     int na = s->num_audio > 0 ? s->num_audio : 1;

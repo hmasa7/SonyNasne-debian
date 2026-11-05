@@ -303,6 +303,22 @@ Issue #14(monutetsu さん)の報告: BS01(BS朝日)を先に開くと、地デ�
 
 **対策(検証済み、1 台・旧カーネル)**: GPL ソースからビルドしたドライバで、復号した直後のファームの secondary を 23 個にすると(`scripts/xc4drv_2629/`、`insmod xcode4drv.ko fw_secondary=23`)、**上の 32 通りがすべて○**になった(D 状態なし、CC エラー 0)。詳細と未確認の点は [docs/25 の 3.10](25_media_engine_firmware.md)。
 
+起動時にこのドライバを使う設定(旧カーネル。公式の `rc.xcode4` を、ドライバを選ぶ `scripts/watchdog/rc.xcode4-select` に置き換える。nasne-mcu-wd・nasne-mcu-hb・nasne-recpt1 の再読込は、どれも `rc.xcode4` を呼ぶ):
+
+```bash
+sh scripts/xc4drv_2629/build.sh                       # PC で → gpl_src/build/xcode4drv.ko
+scp gpl_src/build/xcode4drv.ko root@$NASNE_IP:/usr/local/sbin/xcode4drv-gpl.ko
+scp scripts/watchdog/rc.xcode4-select root@$NASNE_IP:/usr/local/sbin/rc.xcode4.new
+# nasne 上
+cd /usr/local/sbin && [ -f rc.xcode4.orig ] || cp -p rc.xcode4 rc.xcode4.orig
+chmod 755 rc.xcode4.new && mv rc.xcode4.new rc.xcode4
+printf 'XCODE4DRV_KO=/usr/local/sbin/xcode4drv-gpl.ko\nXCODE4DRV_ARGS="fw_secondary=23"\n' > /etc/default/xcode4drv
+```
+
+- 公式に戻すには `/etc/default/xcode4drv` を消して再起動する(公式の `xcode4drv.ko` は置き換えない)。
+- GPL 版を読み込む途中で固まってウォッチドッグでリセットされた場合は、次の起動から自動で公式を使う(`/var/lib/nasne/xcode4drv.failed` ができる。消すと GPL 版に戻る)。
+- 検証済み(1 台): 再起動で GPL 版が読み込まれ、ウォッチドッグの停止・PWR LED・受信サーバが動くこと、本番の受信サーバ(8301)経由で BS15 と地デジ 25ch の同時受信(CC エラー 0)。
+
 **ホスト側の設定では直らなかった**: `program_mode_flags`(`DISABLE_DATA_PIDS`)、`remux_flags`(`REMUX_PARTIAL_TS_NO_DSMCC`)、`component_tag_selection` などをホストから変えても、データ放送の ES は登録され、×のままだった([docs/25 の 3.8](25_media_engine_firmware.md))。
 
 **回避策(`--giveup-no-av <ms>`)**: `--dual-tuner` のとき、もう一方の系統が使用中で、指定した時間までに最初の映像・音声が来なければ、そのセッションを打ち切る(ログ「同時受信で映像・音声が出ないため打ち切る(Issue #14)」)。映らないまま待たされたり、固まったりするのを避け、チューナーを早く解放する。録画ソフトが別のチューナーへ移れるかはソフトしだい(Mirakurun での動作は未確認)。

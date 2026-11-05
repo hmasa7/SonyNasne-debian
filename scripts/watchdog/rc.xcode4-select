@@ -1,0 +1,49 @@
+#!/bin/sh
+# 旧カーネル(2.6.29)用: xcode4drv を読み込む。公式の rc.xcode4 の代わりに /usr/local/sbin/rc.xcode4 として置き、公式は rc.xcode4.orig に改名する。
+# nasne-mcu-wd・nasne-mcu-hb・nasne-recpt1(ファームが止まったときの再読込)は、どれも rc.xcode4 を呼ぶので、ここで読み込むドライバを選ぶ。
+#
+# /etc/default/xcode4drv(無ければ公式のドライバ):
+#   XCODE4DRV_KO=/usr/local/sbin/xcode4drv-gpl.ko   GPL ソースからビルドしたドライバ(scripts/xc4drv_2629/build.sh)
+#   XCODE4DRV_ARGS="fw_secondary=23"                 Issue #14 の対策(docs/25 の 3.10)
+#
+# 再起動のループを防ぐ: GPL 版を読む前に印(PEND)を付け、読み込んだあと MCU への I2C 書き込み(ウォッチドッグ停止)が通ったら消す。
+# 印が残ったまま起動した(読み込み中に固まり、ウォッチドッグでリセットされた)ときは FAILED を作り、以後は公式を使う。
+# GPL 版に戻すには、原因を確かめてから rm /var/lib/nasne/xcode4drv.failed。
+BIN=/usr/local/sbin
+STATE=/var/lib/nasne
+PEND=$STATE/xcode4drv.pending
+FAILED=$STATE/xcode4drv.failed
+XCODE4DRV_KO=
+XCODE4DRV_ARGS=
+[ -f /etc/default/xcode4drv ] && . /etc/default/xcode4drv
+mkdir -p $STATE
+
+official() { cd $BIN && ./rc.xcode4.orig "$@"; }
+
+if [ -z "$XCODE4DRV_KO" ] || [ ! -f "$XCODE4DRV_KO" ]; then official "$@"; exit $?; fi
+if [ -f $PEND ]; then
+    echo "前回 $XCODE4DRV_KO を読み込んだまま確認できなかった。以後は公式のドライバを使う($FAILED)"
+    mv $PEND $FAILED
+fi
+if [ -f $FAILED ]; then official "$@"; exit $?; fi
+
+D=/tmp/xcode4drv-load
+rm -rf $D; mkdir -p $D
+cp $BIN/rc.xcode4.orig $D/rc.xcode4
+ln -s "$XCODE4DRV_KO" $D/xcode4drv.ko
+echo "$(date) $XCODE4DRV_KO $XCODE4DRV_ARGS" > $PEND; sync
+( cd $D && ./rc.xcode4 $XCODE4DRV_ARGS "$@" ); rv=$?
+if [ $rv -ne 0 ] || ! lsmod | grep -q '^xcode4drv'; then
+    echo "$XCODE4DRV_KO を読み込めなかった($rv)。公式のドライバを使う"
+    rm -f $PEND
+    official "$@"; exit $?
+fi
+# ドライバが動いていることを、MCU への I2C 書き込み(ウォッチドッグ停止と同じ値。何度書いてもよい)で確かめる
+n=0
+while [ $n -lt 10 ]; do
+    if $BIN/mcui2c w 20 20 01 >/dev/null 2>&1; then rm -f $PEND; sync; exit 0; fi
+    n=$((n + 1)); sleep 1
+done
+echo "$XCODE4DRV_KO で I2C が通らない。公式のドライバに戻す"
+mv $PEND $FAILED; sync
+official "$@"

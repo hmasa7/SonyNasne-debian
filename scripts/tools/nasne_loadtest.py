@@ -65,7 +65,7 @@ def receive(mirakurun, svc, dwell, res):
     t0 = time.time()
     req = urllib.request.Request(f"{mirakurun}/api/services/{svc['id']}/stream", headers={"X-Mirakurun-Priority": "0"})
     nbytes, sync_lost, first = 0, 0, None
-    cc, ccerr, npk = {}, {}, {}
+    cc, ccerr, npk, cc1st = {}, {}, {}, {}     # cc1st: PID ごとの最初の CC エラーの時刻(受信の開始からの秒)
     pmt_pid, pmt_buf, av = None, b"", None     # PAT → PMT から映像・音声の PID を取る(nasne-recpt1 は最初に PAT・PMT を送る)
     rest = b""
     try:
@@ -118,6 +118,7 @@ def receive(mirakurun, svc, dwell, res):
                     p = cc.get(pid)
                     if p is not None and c != p and c != (p + 1) & 0x0f:
                         ccerr[pid] = ccerr.get(pid, 0) + 1
+                        cc1st.setdefault(pid, round(time.time() - t0, 1))
                     cc[pid] = c
                 rest = buf[n:]
     except urllib.error.HTTPError as e:
@@ -135,6 +136,7 @@ def receive(mirakurun, svc, dwell, res):
         r["av_from_pmt"] = False
     r["av_pids"] = [f"0x{k:04x}" for k in av]
     r["cc_err_av"] = sum(ccerr.get(k, 0) for k in av)
+    r["cc_av_first_s"] = min((cc1st[k] for k in av if k in cc1st), default=None)
     res.append(r)
 
 

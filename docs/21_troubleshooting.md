@@ -60,6 +60,7 @@ PWR LED は MCU の「表示コード」で決まります([docs/06](06_mcu_watc
 | 【CFW共通】 Mirakurun から見て、チューナーがずっと `busy`(`/status`)で、`503 tuner busy` と `respawning because request has not closed` が約10秒周期で出る | Mirakurun が、サービス検出(`Service.Add.Check`)や番組表の取得を、連続してやっている。**Docker で `/app-data` を永続化していない**と、再起動のたびに全サービスをやり直す | `/app-config` と `/app-data` を永続化する(`contrib/epgstation/docker-compose.yml`)。初回は BS/CS で30分〜1時間かかることがある。ほかの Mirakurun/アプリが同じ nasne を使っていないかも確認。詳しくは [docs/11](11_tv_streaming.md) |
 | 【旧】 ssh が `no matching host key type` などで失敗する | nasne の sshd が古い | `-o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa`、RSA の鍵 |
 | 【CFW共通】 時計が1970年から始まる、`apt update` が「Release file is not valid yet」 | 基板にRTCが無い | NTP(`ntpdate`)や `fake-hwclock`。Debian イメージには組み込み済み |
+| 【旧】 時計が少しずつずれる(数時間で十数秒) | Debian の `ntpdate` は、ネットワークがつながったとき(起動時)に 1 回しか合わせない。nasne の時計は 1 時間に 1〜2 秒ずれる(手元の 2 台で、約 7 時間で +11 秒、約 1 時間で +1.25 秒) | `scripts/watchdog/nasne-timesync` を `/usr/local/sbin/` に置き、`/etc/cron.d/nasne-timesync` に `*/10 * * * * root /usr/local/sbin/nasne-timesync`(既定のゲートウェイと `/etc/default/ntpdate` の `NTPSERVERS` に問い合わせる)。`nasne-recpt1` は、時間の計測を単調時計にした版(2026-11-05 以降)を使う。それより前の版は壁時計で測るので、受信中に時刻が飛ぶと、映らない判定や打ち切りが誤って動くことがある |
 
 ## 4. フォールバックと `official-once`
 

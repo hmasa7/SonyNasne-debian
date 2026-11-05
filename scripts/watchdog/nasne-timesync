@@ -1,0 +1,11 @@
+#!/bin/sh
+# nasne-timesync — 時刻を合わせる(cron から 10 分おき)。Debian の ntpdate は、ネットワークがつながったとき(起動時)に 1 回しか合わせない。
+# nasne の時計は 1 時間に 1〜2 秒ずれる(手元の 1 台で、起動から約 7 時間で +11 秒)ので、定期的に合わせる。
+# 問い合わせ先: 既定のゲートウェイ(ルーターが NTP に答えることが多い)と、/etc/default/ntpdate の NTPSERVERS。
+# 0.5 秒未満のずれは少しずつ寄せ(slew)、それより大きいと飛ばす(step)。nasne-recpt1 の時間の計測は単調時計なので、飛んでも影響しない。
+# 置き方: /usr/local/sbin/nasne-timesync、/etc/cron.d/nasne-timesync に「*/10 * * * * root /usr/local/sbin/nasne-timesync」
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+NTPSERVERS=
+[ -f /etc/default/ntpdate ] && . /etc/default/ntpdate
+gw=$(ip route | awk '$1 == "default" { print $3; exit }')
+exec flock -n /var/lock/ntpdate /usr/sbin/ntpdate -s -u -p 2 $gw $NTPSERVERS

@@ -37,6 +37,7 @@
 #define SYS_execve 4011
 #define SYS_chdir  4012
 #define SYS_gettimeofday 4078
+#define SYS_clock_gettime 4263
 #define SYS_flock  4143
 #define SYS_rt_sigaction 4194
 #define SYS_rename 4038
@@ -105,7 +106,11 @@ static int logv;     /* --listen のときは常に1: 行程の節目をstderr(�
 static void lgx(const char *m, unsigned long v);
 static void msleep(unsigned long ms) { long ts[2]; ts[0] = ms / 1000; ts[1] = (ms % 1000) * 1000000; sys3(SYS_nanosleep, (long)ts, 0, 0); }
 static unsigned long now_ms(void);
-static unsigned long now_ms(void) { long tv[2]; sys3(SYS_gettimeofday, (long)tv, 0, 0); return tv[0] * 1000UL + tv[1] / 1000; }
+static unsigned long now_ms(void) {     /* 単調時計(CLOCK_MONOTONIC)。NTP で時刻を合わせても飛ばない(壁時計だと、経過時間が負や過大になって判定を誤る) */
+    long ts[2];
+    if (sys3(SYS_clock_gettime, 1, (long)ts, 0) == 0) return ts[0] * 1000UL + ts[1] / 1000000;
+    sys3(SYS_gettimeofday, (long)ts, 0, 0); return ts[0] * 1000UL + ts[1] / 1000;
+}
 
 static void lgx(const char *m, unsigned long v) {
     if (!logv) return;

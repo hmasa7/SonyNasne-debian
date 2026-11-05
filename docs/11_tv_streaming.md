@@ -197,6 +197,14 @@ Mirakurunのチャンネルスキャン(自動)は、チャンネル全体のTS�
 
 **Docker で Mirakurun を動かすときは、`/app-config` と `/app-data` の両方を永続化してください**(`contrib/epgstation/docker-compose.yml` の `volumes` のとおり)。`/app-data` を永続化しないと、Mirakurun を再起動するたびに、全チャンネルのサービス検出(`Service.Add.Check.*` のジョブ)と番組表の取得をやり直します。nasne のチューナーは1系統なので、そのジョブが連続してチューナーを占有し、視聴や録画が `503 tuner busy` / `/status` が `busy` のまま、という状態が長く続きます(BS/CS を足してチャンネル数が増えるほど長くなる。Issue #6)。初回のスキャンは、BS/CS を含めて30分〜1時間かかることがあります。`nasne-recpt1` のストリーム子プロセスが `ps` で `D` 状態に見えるのは、受信中の通常の状態です。
 
+**Mirakurun が視聴に譲らなくなる条件(2026-11-05、Mirakurun 4.2.1 で確認)**:
+> 層: 【CFW共通】
+
+- 通常は、優先度の高い要求が、低い利用者のチューナーを横取りする(番組表の取得は優先度 -1 なので、視聴(0 以上)に譲る)。手元で、優先度 0 の BS 受信中に優先度 1 で CS を開くと、3〜4 秒で横取りできた。
+- ただし、**受信のコマンドが自分から終了すると**(nasne が 503 を返した、接続が切れた、など)、Mirakurun はチューナーを `isAvailable: false` にしてから、利用者が残っていればコマンドを起動し直す(ログの `respawning because request has not closed`)。**`isAvailable` は、利用者が全員いなくなって解放されるまで false のまま**で、その間は横取りも相乗りもできず、新しい要求は 12.5 秒待って 503(no available tuners)になる(`TunerDevice.js` の `_end()`・`_release()`、`Tuner.js` の `_pickTunerDevice()`)。
+- 手元の再現: 優先度 0 で BS を受信中に、nasne 側でそのセッションの受信プロセスを 1 回止めた → Mirakurun が起動し直し、受信は続いた → 優先度 1 の CS は **12.27 秒で 503**。A が終わるまで `isAvailable: false` のままだった。
+- 番組表の取得(BS/CS で数分)の途中でこれが起きると、取得が終わるまで視聴・録画が 503 になる。受信サーバの再起動や、nasne が `503 tuner busy` を返したとき(Mirakurun の外から nasne を直接使っている場合など)が引き金になる。Issue #11 の報告(番組表の取得のコマンドが `exit code=1` で約 3 秒おきに起動し直し)も、この状態とみられる。
+
 Mirakurunのデコーダー(`decoder`)設定は不要(nasne が復号済みのTSを出す)。複数サービスの同時視聴は、チューナーが1系統なので不可(同じチャンネルの別サービスも不可)。
 
 `tuners.yml` / `channels.yml` は `python3 scripts/nasne_mirakurun_conf.py <nasneのIP> --scan -o <設定ディレクトリ>` で nasne のサービス一覧から自動で作れます(手で書く必要はありません)。
@@ -462,7 +470,7 @@ echo NASNE_RECPT1_SHARED=1 >> /etc/default/nasne-recpt1 && /etc/init.d/nasne-rec
 | 受信中のクライアント切断(SIGPIPE)のあと選局 | B-CAS の処理は 43ms のまま |
 | 本番(8301)・Mirakurun 経由で地デジ 25ch と NHK BS の同時受信 | 両方とも CC の不連続 0・スクランブル 0。最初の映像まで 598・832ms |
 
-- Mirakurun が衛星のチューナーで番組表を取得している間は、視聴の要求に 503 を返した(優先度を上げても譲らず、`isAvailable: false`。数分で取得が終わると空いた)。nasne 側は正常に受信していた。Mirakurun の動きで、`--shared-generic` とは関係しないとみられる(未確認)。
+- Mirakurun が衛星のチューナーで番組表を取得している間は、視聴の要求に 503 を返した(優先度を上げても譲らず、`isAvailable: false`。数分で取得が終わると空いた)。**原因は、試験で本番の受信サーバを止めたため、番組表の取得のコマンドが失敗して起動し直しを繰り返していたこと**(下の「Mirakurun が視聴に譲らなくなる条件」)。`--shared-generic` とは関係しない。
 
 **未確認**: ①何時間も開いたままにしたあとも鍵が取れるか(長時間の運用) ②実運用(Mirakurun/EPGStation からの頻繁な開閉、番組表の巡回)での安定性 ③ドライバの入れ直し(ファームの停止)からの回復の実際の動作 ④【新】6.12 での動作。
 

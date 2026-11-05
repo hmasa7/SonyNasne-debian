@@ -193,6 +193,12 @@ Mirakurun 4.1 + EPGStation 3.0(beta)を Docker で動かし、nasne をチュー
 
 確認済み(2026-10): 約4日の連続運用(EPGStation の予約録画12本)、tvheadend。未確認: 録画後のエンコード。
 
+**nasne 2 台で 4 本の同時録画(2026-11-05)**:
+> 層: 【CFW共通】(旧カーネル、`--dual-tuner --shared-generic`、GPL 版ドライバ `fw_secondary=23`)
+
+- Mirakurun(4.2.1)に、2 台の nasne を地デジ用・衛星用の 4 チューナーとして登録し、EPGStation(3.0.0-beta4)で**地デジ 2 本・BS 2 本を同時に録画できた**。ファイルは 4 本とも増え続け(約 12〜20Mbps)、2 台とも GENERIC の作り直し・出力の停止・`Mips Failed` は 0 件、負荷は約 1.2。
+- **Mirakurun のチューナーの構成(数や、地デジ・BS・CS の割り当て)を変えたら、EPGStation を再起動する**。EPGStation は、起動したときに読んだチューナーの構成で予約の重なりを計算する。地デジ・BS・CS 兼用の 2 チューナーの構成で起動したまま、地デジ用・衛星用の 4 チューナーに分けたら、地デジを 2 本録画している間は BS の予約が `program is conflict` で拒まれた(Mirakurun には BS の要求が来ず、BS のチューナーは空いていた)。EPGStation の再起動で直った。録画中に再起動すると、その録画は止まるので、録画の無い時間に行う。
+
 #### VLC(プレイリスト再生)
 
 先に `curl http://<nasne>:8301/scan` を1回実行して(約80秒)、サービス一覧を保存する。あとは

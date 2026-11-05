@@ -261,9 +261,11 @@ curl 'http://<nasne>:8301/status?detail'     # terrestrial=idle satellite=idle �
 
 ### 選局から最初の映像までの時間の内訳
 
-> 層: 【CFW共通】(測定は【旧】2.6.29 + Debian 7 の CECH-ZNR2J 2 台。`nasne-recpt1` は同じなので【新】でも同じ見込みだが、未測定)
+> 層: 【CFW共通】(測定は【旧】2.6.29 + Debian 7。`nasne-recpt1` は同じなので【新】でも同じ見込みだが、未測定)
 
-`--listen` のときのログ(`/var/log/nasne-recpt1.log`)の節目の差から求めた。過去のログ(地デジ 2,453 回・衛星 1,078 回、2 台)の中央値と、ログを細かくした試作での測定(地デジ 1 局、5〜10 回)。単位は ms。
+`--listen` のときのログ(`/var/log/nasne-recpt1.log`)の節目の差から求めた。単位は ms。
+- B-CAS の 3 行(GENERIC を開く・ACTIVATE・ACTIVATED の待ち)以外: 過去のログの中央値(地デジ 2,453 回・衛星 1,078 回。CECH-ZNR2J と CECH-ZNR1J の各 1 台)。
+- B-CAS の 3 行: ログを細かくした試作での測定(CECH-ZNR2J の 1 台、地デジ 1 局、5〜10 回)。
 
 | 段階 | ログの区間 | 地デジ | 衛星 | 備考 |
 |---|---|---|---|---|

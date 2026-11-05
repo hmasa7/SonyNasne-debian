@@ -457,6 +457,10 @@ static int dbg_drain;     /* 試験用(--dbg-drain) */
 static int dbg_close_pt;  /* 試験用(--dbg-close-pt): 復号ストリームを開いた直後に PSI ストリームを閉じる(Issue #14: ファームの資源の切り分け) */
 static unsigned long dbg_keyprobe;  /* 試験用(--dbg-keyprobe N): 復号ストリームを開いた直後に鍵スロット(CMD2_SDEV_RESERVE_KEYSTORE_SLOT 0x114)を 1 個ずつ、
                                      * 失敗するまで最大 N 回確保し、空き数を数える(Issue #14)。解放の命令は無いので、試験の後はドライバを読み込み直すこと */
+static unsigned long start_pace_ms = 60;   /* --start-pace <ms>: 最初の PAT の後と、最初の映像・音声の前(PAT・PMT を 2 回送り直す前後)で、送り出して待つ時間(0=待たない)。
+                                           * Mirakurun は PAT・PMT を受け取ったかたまりを処理した後で非同期に解析し、PMT を解析し終わるまで(PAT・PMT 自身も含めて)捨てる。
+                                           * そのままだと出力の先頭に PAT・PMT が無く、ファームが出す最初のシーケンスヘッダが使えない。CS では次のヘッダまでが長く、
+                                           * KonomiTV のエンコーダが入力の解析に失敗する(ER-02H。2 回目は解析の範囲を広げるので映る) */
 static unsigned long giveup_ms;   /* --giveup-no-av <ms>: 2系統同時で、この時間映像/音声が出なければセッションを打ち切る(Issue #14。0=無効) */
 /* 試験用(--dbg-sec / --dbg-pt <オフセット>=<値>): OPEN_SECUREDTS・PSI ストリームの構造体の欄を、ioctl の直前に上書きする(Issue #14 の切り分け) */
 #define DBG_MAX 8
@@ -710,6 +714,71 @@ static void put_pkt(const unsigned char *q) {
     for (i = 0; i < 188; i++) outbuf[olen + i] = q[i];
     olen += 188;
 }
+
+/* 最初の映像・音声より前のパケット(PAT・PMT など少数)を PID ごとに覚え、映像・音声の直前に PAT と PMT を送り直す。
+ * Mirakurun は準備完了(PMT の解析)の前に届いた PAT・PMT を捨てるため。局によって PMT が PAT より先に来る(25ch など) */
+#define PRE_PIDS 8
+static unsigned char pre_pkt[PRE_PIDS][4][188];
+static unsigned long pre_pid[PRE_PIDS];
+static int pre_cnt[PRE_PIDS], npre;
+static void pre_store(unsigned long pid, const unsigned char *q) {
+    int i, j;
+    for (i = 0; i < npre && pre_pid[i] != pid; i++) ;
+    if (i == npre) { if (npre == PRE_PIDS || !(q[1] & 0x40)) return; pre_pid[npre++] = pid; pre_cnt[i] = 0; }
+    if (q[1] & 0x40) pre_cnt[i] = 0;
+    if (pre_cnt[i] == 4) return;
+    for (j = 0; j < 188; j++) pre_pkt[i][pre_cnt[i]][j] = q[j];
+    pre_cnt[i]++;
+}
+static int pre_find(unsigned long pid) { int i; for (i = 0; i < npre; i++) if (pre_pid[i] == pid && pre_cnt[i]) return i; return -1; }
+static int pre_pmt(void) {          /* 覚えた PAT の最初の番組(番号 0 = NIT 以外)の PMT が入っている欄。無ければ -1 */
+    int a = pre_find(0);
+    unsigned char *q, *e; unsigned long len;
+    if (a < 0) return -1;
+    q = pre_pkt[a][0]; len = ((q[6] & 0x0f) << 8) | q[7];
+    if (q[4] != 0) return -1;
+    for (e = q + 13; e + 4 <= q + 8 + len - 4 && e + 4 <= q + 188; e += 4)
+        if (e[0] | e[1]) return pre_find(((e[2] & 0x1f) << 8) | e[3]);
+    return -1;
+}
+static int pre_pmt_complete(void) { /* PMT の節が最後のパケットまでそろったか(25ch などは 2 パケットにまたがり、2 つ目は映像の後に来る) */
+    int m = pre_pmt();
+    unsigned char *q;
+    if (m < 0) return 0;
+    q = pre_pkt[m][0];
+    if (q[3] & 0x20) return 1;      /* 適応フィールド付きは想定外。待たない */
+    return 183 - q[4] + 184 * (pre_cnt[m] - 1) >= 3 + (((q[q[4] + 6] & 0x0f) << 8) | q[q[4] + 7]);
+}
+/* PAT・PMT の CC: 送り直した分だけ、その後の元のパケットの CC もずらして連続させる(同じ CC の重複は受け手によってドロップと数えられる) */
+static unsigned long cc_pid[2];         /* [0]=PAT(0) [1]=PMT の PID(未定は 0x2000) */
+static unsigned char cc_last[2], cc_off[2], cc_seen[2];
+static void put_cc(const unsigned char *q) {
+    unsigned long pid = ((q[1] & 0x1f) << 8) | q[2];
+    unsigned char t[188];
+    int x = pid == cc_pid[0] ? 0 : pid == cc_pid[1] ? 1 : -1, i;
+    if (x < 0) { put_pkt(q); return; }
+    for (i = 0; i < 188; i++) t[i] = q[i];
+    t[3] = (q[3] & 0xf0) | ((q[3] + cc_off[x]) & 0x0f);
+    cc_last[x] = t[3] & 0x0f; cc_seen[x] = 1;
+    put_pkt(t);
+}
+static void resend_cc(const unsigned char *q, int x) {
+    if (cc_seen[x]) cc_off[x] = (cc_last[x] + 1 - q[3]) & 0x0f;
+    put_cc(q);
+}
+static void pre_resend(void) {
+    int a = pre_find(0), m = pre_pmt(), j;
+    if (a < 0 || m < 0) return;
+    cc_pid[1] = pre_pid[m];
+    resend_cc(pre_pkt[a][0], 0);
+    for (j = 0; j < pre_cnt[m]; j++) if (j == 0) resend_cc(pre_pkt[m][j], 1); else put_cc(pre_pkt[m][j]);
+}
+/* PMT がそろうまで、最初の映像・音声からのパケットをためておく(最大 HOLD_PKTS パケット・HOLD_MS) */
+#define HOLD_PKTS 4096
+#define HOLD_MS 500
+static unsigned char holdbuf[HOLD_PKTS * 188];
+static unsigned long hold_n;
+static void hold_put(const unsigned char *q) { unsigned long i; for (i = 0; i < 188; i++) holdbuf[hold_n * 188 + i] = q[i]; hold_n++; }
 
 static unsigned long parse_dec(const char *s) { unsigned long v = 0; for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0'); return v; }
 static int is_num(const char *s) { if (!*s) return 0; for (; *s; s++) if (*s < '0' || *s > '9') return 0; return 1; }
@@ -1098,7 +1167,10 @@ again:
     if (http) send_headers(ofd);
     t_start = now_ms(); scr_cnt = 0; nto = 0;
     {   /* 診断: セッションの開始から、映像/音声の最初のパケットが出るまでの時間を記録する(Issue #12: 同時開始で BS の映像・音声が遅れる件) */
-    int av_first = 0;
+    int av_first = 0, pat_paced = 0, holding = 0;
+    unsigned long hold_t = 0;
+    npre = 0; hold_n = 0;
+    cc_pid[0] = 0; cc_pid[1] = 0x2000; cc_off[0] = cc_off[1] = cc_seen[0] = cc_seen[1] = 0;
     while (!stop_flag) {
         unsigned long rv, idx, sz, k;
         if (using_shared && !av_first && !regen_tried && now_ms() - t_start >= REACT_MS) {
@@ -1132,8 +1204,25 @@ again:
                     { unsigned long pid2 = ((p[k + 5] & 0x1f) << 8) | p[k + 6];
                       if (pid2 == s->vpid || (s->num_audio && pid2 == s->apid[0])) {
                         if (dual_mode) av_beat(is_sat);
-                        if (!av_first) { av_first = 1; lgx("first A/V packet, ms since stream start", now_ms() - t_start); lgx("first A/V packet pid", pid2); bcas_unlock(); } } }
-                    put_pkt(p + k + 4);
+                        if (!av_first) {
+                            av_first = 1; lgx("first A/V packet, ms since stream start", now_ms() - t_start); lgx("first A/V packet pid", pid2); bcas_unlock();
+                            if (start_pace_ms) { holding = 1; hold_t = now_ms(); }
+                        } }
+                      if (holding) {
+                          pre_store(pid2, p + k + 4); hold_put(p + k + 4);
+                          if (pre_pmt_complete() || hold_n == HOLD_PKTS || now_ms() - hold_t >= HOLD_MS) {
+                              /* PMT を先に解析させてから、PAT・PMT を送り直す。準備完了の前に届いた分は捨てられるので、待ってもう一度送る */
+                              unsigned long i;
+                              lgx("start pace: held packets", hold_n);
+                              if (olen) flush_out();
+                              msleep(start_pace_ms); pre_resend(); if (olen) flush_out();
+                              msleep(start_pace_ms); pre_resend();
+                              for (i = 0; i < hold_n; i++) put_cc(holdbuf + i * 188);
+                              holding = 0; hold_n = 0;
+                          }
+                      } else put_cc(p + k + 4);
+                      if (!av_first && start_pace_ms) { pre_store(pid2, p + k + 4); if (pid2 == 0) { int m = pre_pmt(); if (m >= 0) cc_pid[1] = pre_pid[m]; } }
+                      if (!av_first && !pat_paced && pid2 == 0 && start_pace_ms) { pat_paced = 1; flush_out(); msleep(start_pace_ms); } }   /* PAT を先に解析させる(PMT の PID が分かってから PMT を送る) */
                 }
                 prev_sec = idx;
             }
@@ -1634,6 +1723,7 @@ int main_c(long *sp) {
         else if (streq(a, "--hold-generic")) hold_generic = 1;
         else if (streq(a, "--si")) si_only = 1;
         else if (streq(a, "--dbg-drain")) { dbg_drain = 1; logv = 1; }
+        else if (streq(a, "--start-pace") && ai + 1 < argc) start_pace_ms = parse_dec(argv[++ai]);
         else if (streq(a, "--dbg-close-pt")) { dbg_close_pt = 1; logv = 1; }
         else if (streq(a, "--dbg-keyprobe") && ai + 1 < argc) { dbg_keyprobe = parse_dec(argv[++ai]); logv = 1; }
         else if (streq(a, "--dbg-sec") && ai + 1 < argc && dbg_sec_n < DBG_MAX) { if (dbg_parse(argv[++ai], &dbg_sec_off[dbg_sec_n], &dbg_sec_val[dbg_sec_n])) dbg_sec_n++; logv = 1; }

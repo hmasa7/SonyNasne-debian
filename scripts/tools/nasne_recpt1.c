@@ -842,6 +842,28 @@ static int other_band_busy(int is_sat) {
     sys3(SYS_close, f, 0, 0);
     return busy;
 }
+/* --shared-generic の回復の判断用: 映像・音声が流れている間、1 秒おきに「時刻と、使っている共有の GENERIC の世代」を系統ごとのファイルに書く。
+ * 映らないセッションは、もう一方の系統が同じ世代で今映っていれば、GENERIC は壊れていない(電波・局の組み合わせなど別の原因)と判断し、作り直さない。
+ * 作り直すと GENERIC を閉じるので、映っている他方の復号まで止めてしまう(2026-11-04 の実運用の問題) */
+#define AV_FILE_T	"/tmp/nasne-recpt1-av-T"
+#define AV_FILE_S	"/tmp/nasne-recpt1-av-S"
+static unsigned long av_beat_ms;
+static void av_beat(int is_sat) {
+    unsigned long v[2], t = now_ms(); long f;
+    if (av_beat_ms && t - av_beat_ms < 1000) return;
+    av_beat_ms = t; v[0] = t; v[1] = using_shared ? gen_no : 0;
+    f = sys3(SYS_open, (long)(is_sat ? AV_FILE_S : AV_FILE_T), 0x100 | 0x200 | 1, 0644);   /* O_CREAT|O_TRUNC|O_WRONLY */
+    if (f < 0) return;
+    sys3(SYS_write, f, (long)v, sizeof(v)); sys3(SYS_close, f, 0, 0);
+}
+static int other_band_av_ok(int is_sat) {      /* もう一方の系統が、同じ共有の GENERIC で、2 秒以内に映像・音声を出していれば 1 */
+    unsigned long v[2]; long f, n;
+    if (!dual_mode || !using_shared || !other_band_busy(is_sat)) return 0;
+    f = sys3(SYS_open, (long)(is_sat ? AV_FILE_T : AV_FILE_S), 0, 0);
+    if (f < 0) return 0;
+    n = sys3(SYS_read, f, (long)v, sizeof(v)); sys3(SYS_close, f, 0, 0);
+    return n == sizeof(v) && now_ms() - v[0] < 2000 && v[1] == gen_no;
+}
 static int acquire_tuner(int is_sat) {
     lockfd = sys3(SYS_open, (long)(dual_mode ? (is_sat ? LOCK_S : LOCK_T) : LOCK_LEGACY), 0x100 | 2, 0644);     /* O_CREAT(MIPSは0x100)|O_RDWR */
     if (sys3(SYS_flock, lockfd, 2 | 4, 0) < 0) { sys3(SYS_close, lockfd, 0, 0); lockfd = -1; return 3; }   /* LOCK_EX|LOCK_NB: 使用中 */
@@ -963,7 +985,7 @@ static void send_headers(int sock) {
 static int si_only;		/* HTTP の ?si=1: SI(PAT/NIT/SDT/EIT/TOT 等)だけを出す。B-CAS の ACTIVATE も復号ストリームも使わない(番組表の取得用。視聴中の別系統に影響しない) */
 static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsigned long want_sid, unsigned long dur_ms, int ofd, int http) {
     int rc, sel; struct svc *s; unsigned long t_start, nto = 0;
-    out_fd = ofd; olen = 0; stop_flag = 0; term_flag = 0; prev_pt = prev_sec = 0xff; h_pt0 = h_pt1 = h_sec0 = h_sec1 = h_g0 = h_g1 = 0; using_shared = regen_tried = 0;
+    out_fd = ofd; olen = 0; stop_flag = 0; term_flag = 0; prev_pt = prev_sec = 0xff; h_pt0 = h_pt1 = h_sec0 = h_sec1 = h_g0 = h_g1 = 0; using_shared = regen_tried = 0; av_beat_ms = 0;
     session_want_sid = si_only ? 0 : want_sid;      /* si_only のときは、PSI ストリームの元の PAT も通す */
     lgx("session start freq", freq_val);
     if (is_sat) lgx("session ts_id", ts_id);
@@ -1031,7 +1053,8 @@ again:
         unsigned long rv, idx, sz, k;
         if (using_shared && !av_first && !regen_tried && now_ms() - t_start >= REACT_MS) {
             regen_tried = 1;    /* ほかのプロセスが GENERIC を閉じると、活性化が失われる(ACTIVATE し直しても戻らない)。親に作り直してもらい、開き直す */
-            if (shared_generic_regen("映像・音声が出ない")) {
+            if (other_band_av_ok(is_sat)) err("映像・音声が出ないが、もう一方の系統は同じ GENERIC で映っているので、作り直さない\n");
+            else if (shared_generic_regen("映像・音声が出ない")) {
                 clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = h_sec0; tb[0xa8 / 4] = h_sec1; ioc(tb, 0xb4, 0x11, 5000); h_sec0 = h_sec1 = 0; prev_sec = 0xff;
                 if (open_streams_inner(s, is_sat) < 0) break;
                 lgx("shared generic: 復号ストリームを開き直した", h_sec0);
@@ -1050,7 +1073,10 @@ again:
                 /* want_sid 指定時はファームウェア生成のシングルサービスPAT(PID 0)をそのまま通す */
                 if (p) for (k = 0; k + 192 <= sz; k += 192) if (p[k + 4] == 0x47 && (want_sid || (p[k + 5] & 0x1f) + p[k + 6] != 0)) {
                     if (reuse_n && (p[k + 7] & 0xc0)) scr_cnt++;
-                    if (!av_first) { unsigned long pid2 = ((p[k + 5] & 0x1f) << 8) | p[k + 6]; if (pid2 == s->vpid || (s->num_audio && pid2 == s->apid[0])) { av_first = 1; lgx("first A/V packet, ms since stream start", now_ms() - t_start); lgx("first A/V packet pid", pid2); bcas_unlock(); } }
+                    { unsigned long pid2 = ((p[k + 5] & 0x1f) << 8) | p[k + 6];
+                      if (pid2 == s->vpid || (s->num_audio && pid2 == s->apid[0])) {
+                        if (dual_mode) av_beat(is_sat);
+                        if (!av_first) { av_first = 1; lgx("first A/V packet, ms since stream start", now_ms() - t_start); lgx("first A/V packet pid", pid2); bcas_unlock(); } } }
                     put_pkt(p + k + 4);
                 }
                 prev_sec = idx;

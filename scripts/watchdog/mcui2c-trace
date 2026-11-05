@@ -1,0 +1,18 @@
+#!/bin/sh
+# mcui2c-trace — mcui2c の呼び出しを記録してから、本物(mcui2c.bin)を呼ぶ。
+# MCU の I2C の読み書きが、ドライバの中で戻らなくなる(D 状態のまま)件の調査用。止まったときに、同時に誰が呼んでいたかを見る。
+#   記録: /tmp/mcui2c-trace.log(稼働秒 start 本物の pid 呼び出し元の pid 呼び出し元のコマンド | 引数 / 稼働秒 end 本物の pid rc=終了コード)
+#   止まっても本体は動いているので、記録は RAM の /tmp に置く(1 秒ごとに呼ばれるため)。2MB を超えたら .1 に回す。
+# 置き方: mv /usr/local/sbin/mcui2c /usr/local/sbin/mcui2c.bin; install -m 755 mcui2c-trace /usr/local/sbin/mcui2c
+#   戻すとき: mv /usr/local/sbin/mcui2c.bin /usr/local/sbin/mcui2c
+LOG=/tmp/mcui2c-trace.log
+BIN=/usr/local/sbin/mcui2c.bin
+caller=$(tr '\0' ' ' < /proc/$PPID/cmdline 2>/dev/null | cut -c1-60)
+"$BIN" "$@" &
+c=$!
+echo "$(cut -d' ' -f1 /proc/uptime) start $c $PPID $caller| $*" >> $LOG
+wait $c
+rc=$?
+echo "$(cut -d' ' -f1 /proc/uptime) end $c rc=$rc" >> $LOG
+[ "$(stat -c %s $LOG 2>/dev/null || echo 0)" -gt 2000000 ] && mv -f $LOG $LOG.1
+exit $rc

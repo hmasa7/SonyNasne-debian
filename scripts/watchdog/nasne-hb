@@ -3,6 +3,7 @@
 #   時刻 稼働秒 負荷 実行中/全プロセス | メモリ(kB): 空き バッファ キャッシュ スラブ | eth0: 受信B 受信pkt 受信err 受信drop 送信B 送信pkt 送信err 送信drop
 #   | 割り込み: IRQ6 の累計(GMAC・SATA が共有) 全体 | D 状態のプロセス数 [名前] | nasne-recpt1 の数
 #   | HDD の温度(SMART の 194/190。省電力で止まっているときは起こさず、読めなければ -)
+#   受信サーバ以外で D 状態が 1 分以上続くプロセスがあれば、/var/log/nasne-hb-dstate.log にカーネルの中の位置などを書き出す(下)。
 # 再起動のあとも読めるよう、行ごとにファイルだけ fsync する(全体の sync はしない)。5MB を超えたら .1 に回す。
 # 置き方: /usr/local/sbin/nasne-hb、/etc/cron.d/nasne-hb に「* * * * * root /usr/local/sbin/nasne-hb」
 LOG=/var/log/nasne-hb.log
@@ -13,8 +14,34 @@ la=$(cut -d' ' -f1-4 /proc/loadavg)
 mem=$(awk '/^(MemFree|Buffers|Cached|Slab):/ { printf "%s ", $2 }' /proc/meminfo)
 eth=$(awk -F'[: ]+' '/eth0:/ { print $3, $4, $5, $6, $11, $12, $13, $14 }' /proc/net/dev)
 irq=$(awk '$1 == "6:" { s6 = $2 } $1 ~ /^[0-9]+:$/ { a += $2 } END { print s6 + 0, a + 0 }' /proc/interrupts)
-dst=$(ps -eo stat=,comm= | awk '$1 ~ /^D/ { n++; s = s "," $2 } END { print n + 0, (n ? substr(s, 2) : "-") }')
+dst=$(ps -e -o stat= -o comm= | awk '$1 ~ /^D/ { n++; s = s "," $2 } END { print n + 0, (n ? substr(s, 2) : "-") }')
 rec=$(ps -eo comm= | grep -c '^nasne-recpt1$')
 hdd=$(timeout 10 /usr/sbin/smartctl -n standby -A /dev/sda 2>/dev/null | awk '$1 == 194 || $1 == 190 { print $10 "C"; exit }')
 printf '%s up=%s la=%s | mem %s| eth0 %s | irq %s | D %s | recpt1 %s | hdd %s\n' "$t" "$up" "$la" "$mem" "$eth" "$irq" "$dst" "$rec" "${hdd:--}" |
     dd of=$LOG oflag=append conv=notrunc,fsync 2>/dev/null
+
+# 受信サーバ以外のプロセスが 2 回続けて(1 分以上)D 状態なら、カーネルの中の位置などを、そのプロセスごとに 1 回だけ書き出す
+# (MCU の I2C の読み書きがドライバの中で戻らなくなる件の調査用)。/tmp の印は再起動で消える
+DLOG=/var/log/nasne-hb-dstate.log
+cur=$(ps -e -o pid= -o stat= -o comm= | awk '$2 ~ /^D/ && $3 !~ /^(nasne-recpt1|pdflush|kswapd|sync|kjournald|xfs)/ { print $1 }')
+prev=" $(cat /tmp/nasne-hb-dprev 2>/dev/null | tr '\n' ' ') "
+done_=" $(cat /tmp/nasne-hb-ddone 2>/dev/null | tr '\n' ' ') "
+echo "$cur" > /tmp/nasne-hb-dprev
+for p in $cur; do
+    case "$prev" in *" $p "*) ;; *) continue ;; esac
+    case "$done_" in *" $p "*) continue ;; esac
+    echo "$p" >> /tmp/nasne-hb-ddone
+    {
+        echo "===== $t up=$up D 状態が続く pid $p"
+        ps -o pid,ppid,stat,etime,time,args -p $p | tail -n 1
+        echo "--- D 状態のプロセスすべての位置"
+        for q in $(ps -e -o pid= -o stat= | awk '$2 ~ /^D/ { print $1 }'); do
+            echo "pid $q: $(ps -o etime= -o args= -p $q) wchan=$(cat /proc/$q/wchan 2>/dev/null)"
+            sed 's/^/    /' /proc/$q/stack 2>/dev/null
+        done
+        echo "--- mcui2c の呼び出しの記録(直近 60 行)"
+        tail -n 60 /tmp/mcui2c-trace.log 2>/dev/null
+        echo "--- dmesg の末尾"
+        dmesg | grep -v 'return_value is 6' | tail -n 30
+    } | dd of=$DLOG oflag=append conv=notrunc,fsync 2>/dev/null
+done

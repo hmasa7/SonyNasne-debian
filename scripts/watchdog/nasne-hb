@@ -1,0 +1,18 @@
+#!/bin/sh
+# nasne-hb — 1 分ごとに、無応答の直前の傾向を見るための値を 1 行ずつ /var/log/nasne-hb.log に足す(cron から呼ぶ)。
+#   時刻 稼働秒 負荷 実行中/全プロセス | メモリ(kB): 空き バッファ キャッシュ スラブ | eth0: 受信B 受信pkt 受信err 受信drop 送信B 送信pkt 送信err 送信drop
+#   | 割り込み: IRQ6 の累計(GMAC・SATA が共有) 全体 | D 状態のプロセス数 [名前] | nasne-recpt1 の数
+# 再起動のあとも読めるよう、行ごとにファイルだけ fsync する(全体の sync はしない)。5MB を超えたら .1 に回す。
+# 置き方: /usr/local/sbin/nasne-hb、/etc/cron.d/nasne-hb に「* * * * * root /usr/local/sbin/nasne-hb」
+LOG=/var/log/nasne-hb.log
+[ -f $LOG ] && [ $(stat -c %s $LOG) -gt 5000000 ] && mv $LOG $LOG.1
+t=$(date '+%F %T')
+up=$(cut -d' ' -f1 /proc/uptime)
+la=$(cut -d' ' -f1-4 /proc/loadavg)
+mem=$(awk '/^(MemFree|Buffers|Cached|Slab):/ { printf "%s ", $2 }' /proc/meminfo)
+eth=$(awk -F'[: ]+' '/eth0:/ { print $3, $4, $5, $6, $11, $12, $13, $14 }' /proc/net/dev)
+irq=$(awk '$1 == "6:" { s6 = $2 } $1 ~ /^[0-9]+:$/ { a += $2 } END { print s6 + 0, a + 0 }' /proc/interrupts)
+dst=$(ps -eo stat=,comm= | awk '$1 ~ /^D/ { n++; s = s "," $2 } END { print n + 0, (n ? substr(s, 2) : "-") }')
+rec=$(ps -eo comm= | grep -c '^nasne-recpt1$')
+printf '%s up=%s la=%s | mem %s| eth0 %s | irq %s | D %s | recpt1 %s\n' "$t" "$up" "$la" "$mem" "$eth" "$irq" "$dst" "$rec" |
+    dd of=$LOG oflag=append conv=notrunc,fsync 2>/dev/null

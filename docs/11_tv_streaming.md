@@ -301,7 +301,9 @@ Issue #14(monutetsu さん)の報告: BS01(BS朝日)を先に開くと、地デ�
 
 **上限の正体**: 22 は、ファームの中のチャンネルのオブジェクトのプール(secondary)の個数で、ファームの定数。1 セッションは PSI ストリーム 1・復号ストリーム 7・B-CAS 側 3 の 11 個を使い、○の組でも 2 系統で 22/22 のちょうど満杯([docs/25 の 3.9](25_media_engine_firmware.md))。PSI ストリームは復号ストリームの入力なので閉じられない(閉じると何も出ない)。
 
-**直し方は未解明**: `program_mode_flags`(`DISABLE_DATA_PIDS`)、`remux_flags`(`REMUX_PARTIAL_TS_NO_DSMCC`)、`component_tag_selection` などをホストから変えても、データ放送の ES は登録され、×のままだった([docs/25 の 3.8](25_media_engine_firmware.md))。
+**対策(検証済み、1 台・旧カーネル)**: GPL ソースからビルドしたドライバで、復号した直後のファームの secondary を 23 個にすると(`scripts/xc4drv_2629/`、`insmod xcode4drv.ko fw_secondary=23`)、**上の 32 通りがすべて○**になった(D 状態なし、CC エラー 0)。詳細と未確認の点は [docs/25 の 3.10](25_media_engine_firmware.md)。
+
+**ホスト側の設定では直らなかった**: `program_mode_flags`(`DISABLE_DATA_PIDS`)、`remux_flags`(`REMUX_PARTIAL_TS_NO_DSMCC`)、`component_tag_selection` などをホストから変えても、データ放送の ES は登録され、×のままだった([docs/25 の 3.8](25_media_engine_firmware.md))。
 
 **回避策(`--giveup-no-av <ms>`)**: `--dual-tuner` のとき、もう一方の系統が使用中で、指定した時間までに最初の映像・音声が来なければ、そのセッションを打ち切る(ログ「同時受信で映像・音声が出ないため打ち切る(Issue #14)」)。映らないまま待たされたり、固まったりするのを避け、チューナーを早く解放する。録画ソフトが別のチューナーへ移れるかはソフトしだい(Mirakurun での動作は未確認)。
 

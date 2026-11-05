@@ -1,0 +1,141 @@
+diff -ru a/kdrv/drv/Os_Linux_Init.c b/kdrv/drv/Os_Linux_Init.c
+--- a/kdrv/drv/Os_Linux_Init.c
++++ b/kdrv/drv/Os_Linux_Init.c
+@@ -56,6 +56,9 @@
+ module_param(Load2ndFirmware, int, 0);
+ extern int fw_secondary;
+ module_param(fw_secondary, int, 0);
++int dbg_i2c = 0;          /* 1: report I2C requests that stay incomplete (see i2c.c). Can be changed via /sys/module/xcode4drv/parameters/dbg_i2c */
++module_param(dbg_i2c, int, 0644);
++extern void xc_i2c_dbg_report(PXCODEDEV pXcode, void *pioctl, unsigned long secs);
+ #else
+ MODULE_PARM(Diagnostic, "int");
+ MODULE_PARM(Board_ID, "int");
+@@ -2453,6 +2456,20 @@
+                     {
+ 
+                         //sleep the thread
++                        if (dbg_i2c && ((IOCTLBUFFERHEADER *)pData)->command == 0x1b)    /* I2C_COMMAND_STREAM: wake every 5 s and report if still not done */
++                        {
++                            PWAITQUEUEEVENT pwq = (PWAITQUEUEEVENT)((uint32)ptemp + size);
++                            unsigned long t0 = jiffies, next = 5;
++                            while (!pwq->condition_variable)
++                            {
++                                wait_event_timeout(pwq->wait_queue_head, pwq->condition_variable, 5 * HZ);
++                                if (!pwq->condition_variable && (jiffies - t0) / HZ >= next)
++                                {
++                                    xc_i2c_dbg_report(pXcode, pData, (jiffies - t0) / HZ);
++                                    next = next < 300 ? 300 : next + 300;
++                                }
++                            }
++                        }
+                         while (!((PWAITQUEUEEVENT)((uint32)ptemp + size))->condition_variable)
+                         {
+                             sleep_current_thread_on_interrupt(pXcode,  (PWAITQUEUEEVENT)((uint32)ptemp + size));
+diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
+--- a/kdrv/drv/i2c.c
++++ b/kdrv/drv/i2c.c
+@@ -22,6 +22,49 @@
+ *******************************************************************************/
+ 
+ #include "devcontext.h"
++#ifdef LINUX
++#include <linux/sched.h>
++#include <linux/jiffies.h>
++/* Debug (dbg_i2c=1): I2C requests (MCU etc.) that never complete and leave the caller asleep in D state.
++ * Keep the last XC_I2C_TR_N I2C events in a ring and dump them with the queue state when a request is stuck. */
++extern int dbg_i2c;
++#define XC_I2C_TR_N 128
++static struct { unsigned long j; int pid; unsigned char ev, blk; unsigned int a, b; } xc_i2c_tr[XC_I2C_TR_N];
++static unsigned int xc_i2c_tr_pos;
++static const char *xc_i2c_ev_name[] = { "?", "start", "queued", "waited", "complete", "next", "callback", "timer" };
++static void xc_i2c_tr_add(int ev, int blk, unsigned int a, unsigned int b)
++{
++    unsigned int i = xc_i2c_tr_pos++ % XC_I2C_TR_N;
++    xc_i2c_tr[i].j = jiffies; xc_i2c_tr[i].pid = current->pid; xc_i2c_tr[i].ev = ev; xc_i2c_tr[i].blk = blk;
++    xc_i2c_tr[i].a = a; xc_i2c_tr[i].b = b;
++}
++#define XC_I2C_TR(ev, blk, a, b) do { if (dbg_i2c) xc_i2c_tr_add(ev, blk, (unsigned int)(a), (unsigned int)(b)); } while (0)
++void xc_i2c_dbg_report(PXCODEDEV pXcode, void *pioctl, unsigned long secs)
++{
++    uint32 st = 0, mtx = 0, cmd, b;
++    unsigned int n, k, pos = xc_i2c_tr_pos;
++    printk(KERN_WARNING "xc_i2c_dbg: pid %d (%s) I2C request %p not completed after %lu s\n", current->pid, current->comm, pioctl, secs);
++    MMR_READ_CHECK(pXcode, &st, XC_PPC_INT_STATUS);
++    MMR_READ_CHECK(pXcode, &mtx, XC_I2C_HW_MUTEX);
++    printk(KERN_WARNING "xc_i2c_dbg: PPC_INT_STATUS %08x I2C_HW_MUTEX %08x semaphore %d\n", st, mtx, (int)pXcode->i2c_semaphore);
++    for (b = 0; b < I2CBLOCKMAX; b++) {
++        cmd = 0;
++        MMR_READ_CHECK(pXcode, &cmd, pXcode->ProcI2cComQueue[b].i2c_reg_offsets.command_reg_offset);
++        printk(KERN_WARNING "xc_i2c_dbg: block %u current %p completed %d head %u tail %u full %u cmdreg %08x\n", b,
++               pXcode->ProcI2cComQueue[b].pcurrent_i2c_data_com, (int)pXcode->ProcI2cComQueue[b].current_completed,
++               (unsigned int)pXcode->ProcI2cComQueue[b].head, (unsigned int)pXcode->ProcI2cComQueue[b].tail,
++               (unsigned int)pXcode->ProcI2cComQueue[b].full, cmd);
++    }
++    n = pos < XC_I2C_TR_N ? pos : XC_I2C_TR_N;
++    for (k = pos - n; k != pos; k++) {
++        unsigned int i = k % XC_I2C_TR_N;
++        printk(KERN_WARNING "xc_i2c_dbg: [-%lu ms] pid %d %s blk %u a %x b %x\n", (long)(jiffies - xc_i2c_tr[i].j) * 1000 / HZ,
++               xc_i2c_tr[i].pid, xc_i2c_tr[i].ev < 8 ? xc_i2c_ev_name[xc_i2c_tr[i].ev] : "?", xc_i2c_tr[i].blk, xc_i2c_tr[i].a, xc_i2c_tr[i].b);
++    }
++}
++#else
++#define XC_I2C_TR(ev, blk, a, b) do { } while (0)
++#endif
+ 
+ /* Defines */
+ 
+@@ -516,6 +559,7 @@
+         pXcode->ProcI2cComQueue[i2cblock].pcurrent_i2c_data_com = pI2cDataComBuffer;
+ 
+         pXcode->ProcI2cComQueue[i2cblock].current_completed = IOCTL_RET_CMD_PROCESSING;
++        XC_I2C_TR(1, i2cblock, pI2cDataComBuffer->slave_address, pI2cDataComBuffer->rop);
+ 
+         //first reset the hw read and write pointers
+         //reset not required for spyder
+@@ -674,11 +718,13 @@
+             checkdpc = 0;
+         }
+         checkdpc = 1;
++        XC_I2C_TR(3, i2cblock, pXcode->ProcI2cComQueue[i2cblock].current_completed, waitcount2 - waitcount);
+ #endif // SERIALIZEI2C
+     }  // end if (pXcode->ProcI2cComQueue[i2cblock].pcurrent_i2c_data_com == NULL)
+     else
+     {
+         retval = i2c_insert_into_queue(pXcode, pI2cDataComBuffer);
++        XC_I2C_TR(2, i2cblock, pXcode->ProcI2cComQueue[i2cblock].head, pXcode->ProcI2cComQueue[i2cblock].tail);
+     }
+ 
+ 
+@@ -774,6 +820,7 @@
+                 pXcode->i2c_semaphore--;
+ 
+                 pcurrentdatabuffer = pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com;
++                XC_I2C_TR(4, count1, pXcode->ProcI2cComQueue[count1].current_completed, pcurrentdatabuffer->slave_address);
+                 i2cfunccallback = pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com->call_back;
+                 pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com->is_complete = IOCTL_RET_CMD_COMPLETE;
+ 
+@@ -941,6 +988,7 @@
+                     PI2CDATACOMBUFFER pTemp;
+                     
+                     PDEBUG("process i2c command in queue\n");
++                    XC_I2C_TR(5, count1, pXcode->ProcI2cComQueue[count1].tail, pXcode->ProcI2cComQueue[count1].head);
+ 
+                     pXcode->ProcI2cComQueue[count1].full = I2CQUEUEEMPTY;
+                     pTemp = pXcode->ProcI2cComQueue[count1].i2c_func_call_buffer[pXcode->ProcI2cComQueue[count1].tail].pi2c_data_com_buffer;
+@@ -960,6 +1008,7 @@
+ 
+                 if ( i2cfunccallback != NULL)
+                 {
++                    XC_I2C_TR(6, count1, 0, 0);
+                     i2cfunccallback(pXcode, (pvoid)pcurrentdatabuffer, 0, 0);
+                 }
+             }
+@@ -974,6 +1023,7 @@
+         Wait_System_Event(pXcode, pXcode->I2cSubmitEvent, &irql);
+ 
+         pcurrentdatabuffer = pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com;
++        XC_I2C_TR(7, BlockId, 0, 0);
+         i2cfunccallback = pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com->call_back;
+ 
+         pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com->is_complete = IOCTL_RET_CMD_HW_TIMED_OUT_ERROR;

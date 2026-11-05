@@ -42,6 +42,8 @@ for p in $cur; do
         echo "--- mcui2c の呼び出しの記録(直近 60 行)"
         tail -n 60 /tmp/mcui2c-trace.log 2>/dev/null
         echo "--- dmesg の末尾"
-        dmesg | grep -v 'return_value is 6' | tail -n 30
+        dmesg | grep -v -e 'return_value is 6' -e 'xc_i2c_dbg' | tail -n 30
+        echo "--- ドライバの I2C の記録(xcode4drv の dbg_i2c=1 のとき)"
+        dmesg | grep 'xc_i2c_dbg' | tail -n 160
     } | dd of=$DLOG oflag=append conv=notrunc,fsync 2>/dev/null
 done

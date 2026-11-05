@@ -5,6 +5,7 @@
 #         NASNE_CUSTOM=1 sh scripts/kernel_build/build.sh で gpl_src/build/mips-linux-2.6.29 をビルド済み(実機のカーネルと同じ設定)
 #   使い方: sh scripts/xc4drv_2629/build.sh [出力ファイル(既定 gpl_src/build/xcode4drv.ko)]
 #   読み込み: insmod xcode4drv.ko fw_secondary=23(付けなければ純正と同じ動作)。docs/25 の 3.10
+#             dbg_i2c=1 で、I2C の要求が 5 秒たっても完了しないとき、待ち行列の状態と直近の I2C の出来事をカーネルのログに出す
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$ROOT/scripts/xc4drv_2629
@@ -25,6 +26,7 @@ for m in t.getmembers():
         t.extract(m, sys.argv[2])
 PY
 patch -p1 -s -d "$W" < "$HERE/fw_secondary.patch"
+patch -p1 -s -d "$W" < "$HERE/i2c_debug.patch"      # 調査用(dbg_i2c=1 のときだけ動く): I2C の要求が完了しないまま止まる件
 cp "$HERE/Kbuild" "$W/kdrv/Kbuild"
 docker run --rm --user "$(id -u):$(id -g)" -v "$KSRC":/work -v "$W":/xc nasne-kcc:gcc432 sh -c '
   make ARCH=mips CROSS_COMPILE=mipsel-linux- -j8 modules_prepare >/dev/null 2>&1

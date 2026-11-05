@@ -307,7 +307,7 @@ Issue #14(monutetsu さん)の報告: BS01(BS朝日)を先に開くと、地デ�
 
 **上限の正体**: 22 は、ファームの中のチャンネルのオブジェクトのプール(secondary)の個数で、ファームの定数。1 セッションは PSI ストリーム 1・復号ストリーム 7・B-CAS 側 3 の 11 個を使い、○の組でも 2 系統で 22/22 のちょうど満杯([docs/25 の 3.9](25_media_engine_firmware.md))。PSI ストリームは復号ストリームの入力なので閉じられない(閉じると何も出ない)。
 
-**対策(検証済み、CECH-ZNR2J 2 台・旧カーネル)**: GPL ソースからビルドしたドライバで、復号した直後のファームの secondary を 23 個にすると(`scripts/xc4drv_2629/`、`insmod xcode4drv.ko fw_secondary=23`)、**上の 32 通りがすべて○**になった(D 状態なし、CC エラー 0)。2 台目(公式ドライバの md5 が 1 台目と同じ)では、×だった 25・16・21ch と BS の組み合わせ 6 通り(両方の順)で、後から開いた系統も映り、映像・音声の CC エラーは 0(`--shared-generic` あり)。さらに、**2 台を Mirakurun(4.2.1)に地デジ用・衛星用の 4 チューナーとして登録し、KonomiTV(0.14.1)で地デジ 2 本・BS 2 本を同時に視聴できた**(うち 1 台は ×だった 25ch + BS)。その間、2 台とも GENERIC の作り直し・出力の停止・`Mips Failed` は 0 件、負荷は約 2。詳細と未確認の点は [docs/25 の 3.10](25_media_engine_firmware.md)。
+**対策(検証済み、CECH-ZNR2J・CECH-ZNR1J 各 1 台、旧カーネル)**: GPL ソースからビルドしたドライバで、復号した直後のファームの secondary を 23 個にすると(`scripts/xc4drv_2629/`、`insmod xcode4drv.ko fw_secondary=23`)、**上の 32 通りがすべて○**になった(D 状態なし、CC エラー 0)。CECH-ZNR1J(公式ドライバ `xcode4drv.ko` の md5 が CECH-ZNR2J と同じ。SoC・メモリ・SPI の区画も同じ)では、×だった 25・16・21ch と BS の組み合わせ 6 通り(両方の順)で、後から開いた系統も映り、映像・音声の CC エラーは 0(`--shared-generic` あり)。さらに、**2 台を Mirakurun(4.2.1)に地デジ用・衛星用の 4 チューナーとして登録し、KonomiTV(0.14.1)で地デジ 2 本・BS 2 本を同時に視聴できた**(うち 1 台は ×だった 25ch + BS)。その間、2 台とも GENERIC の作り直し・出力の停止・`Mips Failed` は 0 件、負荷は約 2。詳細と未確認の点は [docs/25 の 3.10](25_media_engine_firmware.md)。
 
 起動時にこのドライバを使う設定(旧カーネル。公式の `rc.xcode4` を、ドライバを選ぶ `scripts/watchdog/rc.xcode4-select` に置き換える。nasne-mcu-wd・nasne-mcu-hb・nasne-recpt1 の再読込は、どれも `rc.xcode4` を呼ぶ):
 

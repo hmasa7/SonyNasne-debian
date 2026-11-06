@@ -8,12 +8,15 @@
 # Short-Description: 電源ボタン長押し(MCUのステータス2バイト目のbit4)を検出して poweroff する
 ### END INIT INFO
 # 公式では、電源ボタンの長押しをMCUがステータス(mcui2c r 20 6 の6バイト)の2バイト目のbit4(0x10)に立て、procmngがそれを見て終了処理に入る。
-# ここでは1秒ごとにそのビットを読み、「立っていない→立った」の変化を検出したら poweroff する(起動時にすでに立っていた分は無視する)。
+# ここでは一定の間隔(既定 10 秒。NASNE_PWRBTN_INTERVAL)でそのビットを読み、「立っていない→立った」の変化を検出したら poweroff する(起動時にすでに立っていた分は無視する)。
 # ラッチは、電源を入れ直すとクリアされるが、reboot ではクリアされない(実機で確認)。そこで、reboot で止めるときに(rc6 の stop で)その時の値を
 # /var/lib/nasne-powerbtn.reboot に残し、起動時に「reboot をまたいで残っているだけの古いラッチ」と「起動中に押された長押し」を区別する。
 # 電源は a-nasne-poweroff が実際に切る(MCUへ [0x02,0x01])。前提: mcui2c と公式ドライバ(nasne-mcu-wd が読み込む)。
+# 設定: /etc/default/nasne-powerbtn(NASNE_PWRBTN_INTERVAL=秒)。MCU は I2C の転送ごとに一定の確率で誤動作する(I2C が止まる・
+# 勝手に電源を切る。docs/06)ので、読む回数を減らすため既定を 10 秒にした(以前は 1 秒)。長押しは MCU がラッチするので取りこぼさない
+[ -r /etc/default/nasne-powerbtn ] && . /etc/default/nasne-powerbtn
 BIN=${NASNE_BIN:-/usr/local/sbin}
-INTERVAL=${NASNE_PWRBTN_INTERVAL:-1}
+INTERVAL=${NASNE_PWRBTN_INTERVAL:-10}
 POWEROFF=${NASNE_POWEROFF_CMD:-poweroff}
 PIDFILE=/var/run/nasne-powerbtn.pid
 STATE=/var/lib/nasne-powerbtn.reboot

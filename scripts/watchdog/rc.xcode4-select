@@ -20,6 +20,19 @@ mkdir -p $STATE
 
 official() { cd $BIN && ./rc.xcode4.orig "$@"; }
 
+# 使用中のドライバは外さない。xcode4drv は、デバイスを開いているプロセス(ドライバの中で眠っているものを含む)がいても
+# rmmod できてしまい、そのプロセスが外したコードに戻ってカーネルが壊れ、本体全体が止まる(2026-11-06 に 2 回)。
+# 読み込み済みで使用中なら、何もせずに記録だけ残して終わる(止まったファームは直らないが、本体は止まらない)。
+if lsmod | grep -q '^xcode4drv '; then
+    users=$(ls -l /proc/[0-9]*/fd 2>/dev/null | grep -c '/dev/vixs/')
+    if [ "$users" -gt 0 ]; then
+        msg="$(date) xcode4drv は使用中($users 個の fd)なので入れ直さない"
+        echo "$msg"; echo "$msg" >> /var/log/rc.xcode4-refused.log
+        logger -t rc.xcode4 "$msg" 2>/dev/null
+        exit 1
+    fi
+fi
+
 if [ -z "$XCODE4DRV_KO" ] || [ ! -f "$XCODE4DRV_KO" ]; then official "$@"; exit $?; fi
 if [ -f $PEND ]; then
     echo "前回 $XCODE4DRV_KO を読み込んだまま確認できなかった。以後は公式のドライバを使う($FAILED)"

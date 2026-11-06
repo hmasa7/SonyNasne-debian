@@ -1,14 +1,19 @@
 #!/bin/sh
-# mcui2c-trace — mcui2c の呼び出しを記録してから、本物(mcui2c.bin)を呼ぶ。
-# MCU の I2C の読み書きが、ドライバの中で戻らなくなる(D 状態のまま)件の調査用。止まったときに、同時に誰が呼んでいたかを見る。
-#   記録: /tmp/mcui2c-trace.log(稼働秒 start 本物の pid 呼び出し元の pid 呼び出し元のコマンド | 引数 / 稼働秒 end 本物の pid rc=終了コード)
+# mcui2c-trace — mcui2c の呼び出しを、1 つずつ順に(ロック)、記録してから本物(mcui2c.bin)で行う。
+# MCU の I2C(バス 0)の転送がハードウェアのレベルで終わらなくなると、ドライバの中で戻らない(D 状態の)プロセスが
+# 呼ばれるたびに溜まり続ける(2026-11-06 に 97 個まで溜まった)。ロックで同時に 1 つだけにし、前の呼び出しが
+# LOCK_WAIT 秒たっても終わらなければ、待たずに失敗(rc=75)で返す。止まっても、D 状態は 1 つで済む。
+#   記録: /tmp/mcui2c-trace.log(稼働秒 start 本物の pid 呼び出し元の pid 呼び出し元 | 引数 / 稼働秒 end 本物の pid rc=終了コード)
 #   止まっても本体は動いているので、記録は RAM の /tmp に置く(1 秒ごとに呼ばれるため)。2MB を超えたら .1 に回す。
 # 置き方: mv /usr/local/sbin/mcui2c /usr/local/sbin/mcui2c.bin; install -m 755 mcui2c-trace /usr/local/sbin/mcui2c
 #   戻すとき: mv /usr/local/sbin/mcui2c.bin /usr/local/sbin/mcui2c
 LOG=/tmp/mcui2c-trace.log
 BIN=/usr/local/sbin/mcui2c.bin
+LOCK=/tmp/mcui2c.lock
+LOCK_WAIT=10
 caller=$(tr '\0' ' ' < /proc/$PPID/cmdline 2>/dev/null | cut -c1-60)
-"$BIN" "$@" &
+( flock -w $LOCK_WAIT 9 || { echo "mcui2c: 前の呼び出しが $LOCK_WAIT 秒たっても終わらない(MCU の I2C が止まっている可能性)" >&2; exit 75; }
+  exec "$BIN" "$@" ) 9>>$LOCK &      # 本物がロックの fd 9 を持ったまま動く(止まれば、ロックも持ったまま = 後の呼び出しは待って失敗する)
 c=$!
 echo "$(cut -d' ' -f1 /proc/uptime) start $c $PPID $caller| $*" >> $LOG
 wait $c

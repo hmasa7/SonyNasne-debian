@@ -20,7 +20,8 @@ INTERVAL=${NASNE_PWRBTN_INTERVAL:-10}
 POWEROFF=${NASNE_POWEROFF_CMD:-poweroff}
 PIDFILE=/var/run/nasne-powerbtn.pid
 STATE=/var/lib/nasne-powerbtn.reboot
-status_b1() { "$BIN/mcui2c" r 20 6 2>/dev/null | sed -n 's/.*data=[0-9a-f][0-9a-f] \([0-9a-f][0-9a-f]\) .*/\1/p'; }
+# 要るのは 2 バイト目だけなので 2 バイトだけ読む(I2C のクロックを減らす。6 バイト読みより MCU の誤動作が少なかった本体がある。docs/06)
+status_b1() { "$BIN/mcui2c" r 20 2 2>/dev/null | sed -n 's/.*data=[0-9a-f][0-9a-f] \([0-9a-f][0-9a-f]\) .*/\1/p'; }
 run() {
     # 起動直後は MCU のドライバがまだ読み込まれていないことがある。最初の読み取りが成功するまで待つ(失敗のまま 0 と見なすと、残っているラッチを新しい長押しと取り違える)
     v=""; n=0

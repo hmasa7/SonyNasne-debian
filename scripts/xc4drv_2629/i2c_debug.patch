@@ -11,7 +11,7 @@ diff -ru a/kdrv/drv/Os_Linux_Init.c b/kdrv/drv/Os_Linux_Init.c
  #else
  MODULE_PARM(Diagnostic, "int");
  MODULE_PARM(Board_ID, "int");
-@@ -174,6 +177,17 @@
+@@ -174,6 +177,30 @@
  PXCODEDEV pXcodeContext_Global[MAXXCODEDEV] = {
                                         NULL
                                         };
@@ -24,12 +24,25 @@ diff -ru a/kdrv/drv/Os_Linux_Init.c b/kdrv/drv/Os_Linux_Init.c
 +    return 0;
 +}
 +module_param_call(dbg_i2c_dump, dbg_i2c_dump_set, NULL, NULL, 0200);
++/* echo 0 > /sys/module/xcode4drv/parameters/dbg_i2c_recover: free a stuck I2C block-0 (MCU) bus by clocking SCL as GPIO
++ * (see xc_i2c_dbg_recover in i2c.c). Only by hand, while the bus is stuck. dbg_i2c_scl/dbg_i2c_sda = GPIO_I bit numbers. */
++extern void xc_i2c_dbg_recover(PXCODEDEV pXcode, uint32 blk);
++extern int dbg_i2c_scl, dbg_i2c_sda;
++module_param(dbg_i2c_scl, int, 0644);
++module_param(dbg_i2c_sda, int, 0644);
++static int dbg_i2c_recover_set(const char *val, struct kernel_param *kp)
++{
++    if (pXcodeContext_Global[0] != NULL)
++        xc_i2c_dbg_recover(pXcodeContext_Global[0], (uint32)simple_strtoul(val, NULL, 0));
++    return 0;
++}
++module_param_call(dbg_i2c_recover, dbg_i2c_recover_set, NULL, NULL, 0200);
 +#endif
 +
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27)
  static int boxster_vma_nopage(struct vm_area_struct *vma, struct vm_fault *vmf);
-@@ -2453,6 +2467,20 @@
+@@ -2453,6 +2480,20 @@
                      {
  
                          //sleep the thread
@@ -53,13 +66,14 @@ diff -ru a/kdrv/drv/Os_Linux_Init.c b/kdrv/drv/Os_Linux_Init.c
 diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
 --- a/kdrv/drv/i2c.c
 +++ b/kdrv/drv/i2c.c
-@@ -22,6 +22,119 @@
+@@ -22,6 +22,173 @@
  *******************************************************************************/
  
  #include "devcontext.h"
 +#ifdef LINUX
 +#include <linux/sched.h>
 +#include <linux/jiffies.h>
++#include <linux/delay.h>
 +/* Debug (dbg_i2c=1): I2C requests (MCU etc.) that never complete and leave the caller asleep in D state.
 + * Keep the last XC_I2C_TR_N I2C events of each block in its own ring (block 1 = tuners is busy and would push
 + * block 0 = MCU out of a shared ring), count interrupts/completions/errors per block, and dump them with the
@@ -133,6 +147,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
 +        { "I2C_HW_MUTEX", XC_I2C_HW_MUTEX }, { "GPIO_I_CTRL", XC_GPIO_I_CTRL },
 +        { "I2C0_CONFIG", XC_I2C0_CONFIG }, { "I2C0_COMMAND", XC_I2C0_COMMAND },
 +        { "I2C1_CONFIG", XC_I2C1_CONFIG }, { "I2C1_COMMAND", XC_I2C1_COMMAND },
++        { "GPIO_I_IN", XC_GPIO_I_IN }, { "GPIO_I_OUT", XC_GPIO_I_OUT }, { "GPIO_I_OE", XC_GPIO_I_OE },
 +    };      /* status/config/command only: the data registers are FIFOs and are not read */
 +    uint32 v, b;
 +    unsigned int n, k, r;
@@ -163,6 +178,58 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
 +        }
 +    }
 +}
++
++/* Bus recovery for I2C block 0 (MCU), started by hand: echo 0 > /sys/module/xcode4drv/parameters/dbg_i2c_recover
++ * GPIO_I_IN bits 4/5 move only while the MCU is accessed (measured on CECH-ZNR1J/ZNR2J); bit 4 changes about
++ * three times as often, so it is taken as SCL and bit 5 as SDA (dbg_i2c_scl / dbg_i2c_sda to change).
++ * Steps: switch the block-0 pins to GPIO (GPIO_I_CTRL bit 29), release both lines, clock SCL (open drain: OE=1 with
++ * OUT=0 pulls low, OE=0 releases) until SDA is high (at most 16 pulses), send STOP, give the pins back to the I2C
++ * block and print the line levels and the command register at each step. The pending request and the queue are not
++ * touched: if the controller then finishes (or reports the error), the normal interrupt path completes it. */
++int dbg_i2c_scl = 4, dbg_i2c_sda = 5;
++void xc_i2c_dbg_recover(PXCODEDEV pXcode, uint32 blk)
++{
++    uint32 ctrl = 0, out = 0, oe = 0, in = 0, cmd = 0, irql, scl, sda, i, w, stuck = 0;
++    if (blk != 0 || dbg_i2c_scl < 0 || dbg_i2c_scl > 15 || dbg_i2c_sda < 0 || dbg_i2c_sda > 15 || dbg_i2c_scl == dbg_i2c_sda) {
++        printk(KERN_WARNING "xc_i2c_dbg: recover: only block 0 (scl %d sda %d)\n", dbg_i2c_scl, dbg_i2c_sda);
++        return;
++    }
++    scl = 1u << dbg_i2c_scl; sda = 1u << dbg_i2c_sda;
++    Wait_System_Event(pXcode, pXcode->I2cSubmitEvent, &irql);
++    MMR_READ_CHECK(pXcode, &cmd, XC_I2C0_COMMAND); MMR_READ_CHECK(pXcode, &in, XC_GPIO_I_IN);
++    MMR_READ_CHECK(pXcode, &ctrl, XC_GPIO_I_CTRL); MMR_READ_CHECK(pXcode, &out, XC_GPIO_I_OUT); MMR_READ_CHECK(pXcode, &oe, XC_GPIO_I_OE);
++    printk(KERN_WARNING "xc_i2c_dbg: recover: before cmd %08x in %04x (scl %u sda %u) ctrl %08x out %04x oe %04x\n",
++           cmd, in, !!(in & scl), !!(sda & in), ctrl, out, oe);
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OE, oe & ~(scl | sda));           /* both released */
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OUT, out & ~(scl | sda));         /* driving = low */
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_CTRL, ctrl | (1u << 29));          /* block-0 pins -> GPIO */
++    udelay(100);
++    MMR_READ_CHECK(pXcode, &in, XC_GPIO_I_IN);
++    printk(KERN_WARNING "xc_i2c_dbg: recover: gpio mode in %04x (scl %u sda %u)\n", in, !!(in & scl), !!(in & sda));
++    for (i = 0; i < 16 && !(in & sda); i++) {
++        MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OE, (oe & ~(scl | sda)) | scl); udelay(50);   /* SCL low */
++        MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OE, oe & ~(scl | sda));                       /* SCL released */
++        for (w = 0; w < 20; w++) { udelay(50); MMR_READ_CHECK(pXcode, &in, XC_GPIO_I_IN); if (in & scl) break; }
++        if (!(in & scl)) stuck++;
++        udelay(50); MMR_READ_CHECK(pXcode, &in, XC_GPIO_I_IN);
++    }
++    /* STOP: SDA low while SCL is high, then release SDA */
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OE, (oe & ~(scl | sda)) | sda); udelay(50);
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OE, oe & ~(scl | sda)); udelay(50);
++    MMR_READ_CHECK(pXcode, &in, XC_GPIO_I_IN);
++    printk(KERN_WARNING "xc_i2c_dbg: recover: %u pulses, scl held low %u times, after stop in %04x (scl %u sda %u)\n",
++           i, stuck, in, !!(in & scl), !!(in & sda));
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OUT, out);
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_OE, oe);
++    MMR_WRITE_CHECK(pXcode, XC_GPIO_I_CTRL, ctrl);                       /* pins back to the I2C block */
++    Set_System_Event(pXcode, pXcode->I2cSubmitEvent, &irql);
++    for (w = 0; w < 5; w++) {
++        msleep(100);
++        MMR_READ_CHECK(pXcode, &cmd, XC_I2C0_COMMAND); MMR_READ_CHECK(pXcode, &in, XC_GPIO_I_IN);
++        printk(KERN_WARNING "xc_i2c_dbg: recover: +%u ms cmd %08x in %04x current %p\n", (w + 1) * 100, cmd, in,
++               pXcode->ProcI2cComQueue[0].pcurrent_i2c_data_com);
++    }
++}
 +#else
 +#define XC_I2C_TR(ev, blk, a, b) do { } while (0)
 +#define xc_i2c_dbg_start(p, b) do { } while (0)
@@ -173,7 +240,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
  
  /* Defines */
  
-@@ -431,6 +544,7 @@
+@@ -431,6 +598,7 @@
  			if ( gpio_i_ctrl & gpio_i_i2c_mask )
  			{
  				//PDEBUG("i2c_submit_command() reset GPIO_I_CTRL(0x%x -> 0x%x) for I2C control\n", gpio_i_ctrl, (gpio_i_ctrl & ~gpio_i_i2c_mask));
@@ -181,7 +248,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
  				gpio_i_ctrl &= ~gpio_i_i2c_mask;
  				
  				if (MMR_WRITE_CHECK(pXcode, XC_GPIO_I_CTRL, gpio_i_ctrl) == RET_NODEVICE)
-@@ -516,6 +630,7 @@
+@@ -516,6 +684,7 @@
          pXcode->ProcI2cComQueue[i2cblock].pcurrent_i2c_data_com = pI2cDataComBuffer;
  
          pXcode->ProcI2cComQueue[i2cblock].current_completed = IOCTL_RET_CMD_PROCESSING;
@@ -189,7 +256,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
  
          //first reset the hw read and write pointers
          //reset not required for spyder
-@@ -590,6 +705,7 @@
+@@ -590,6 +759,7 @@
  #endif
  //        KdPrint(("pXcode->ProcI2cComQueue[i2cblock].i2c_reg_offsets.config_reg_offset = %x\n", pXcode->ProcI2cComQueue[i2cblock].i2c_reg_offsets.config_reg_offset));
  
@@ -197,7 +264,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
          //set up command register
          temp1 = 0;
          temp = pXcode->ProcI2cComQueue[i2cblock].pcurrent_i2c_data_com->slave_address;
-@@ -674,11 +790,13 @@
+@@ -674,11 +844,13 @@
              checkdpc = 0;
          }
          checkdpc = 1;
@@ -211,7 +278,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
      }
  
  
-@@ -774,6 +892,7 @@
+@@ -774,6 +946,7 @@
                  pXcode->i2c_semaphore--;
  
                  pcurrentdatabuffer = pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com;
@@ -219,7 +286,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
                  i2cfunccallback = pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com->call_back;
                  pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com->is_complete = IOCTL_RET_CMD_COMPLETE;
  
-@@ -792,6 +911,7 @@
+@@ -792,6 +965,7 @@
                      //return RET_NODEVICE;
                  }
  #endif
@@ -227,7 +294,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
                  if (pXcode->ProcI2cComQueue[count1].current_completed == IOCTL_RET_CMD_FAIL_HW_ERROR)
                  {
  #ifdef VIXS_USBD
-@@ -941,6 +1061,7 @@
+@@ -941,6 +1115,7 @@
                      PI2CDATACOMBUFFER pTemp;
                      
                      PDEBUG("process i2c command in queue\n");
@@ -235,7 +302,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
  
                      pXcode->ProcI2cComQueue[count1].full = I2CQUEUEEMPTY;
                      pTemp = pXcode->ProcI2cComQueue[count1].i2c_func_call_buffer[pXcode->ProcI2cComQueue[count1].tail].pi2c_data_com_buffer;
-@@ -960,6 +1081,7 @@
+@@ -960,6 +1135,7 @@
  
                  if ( i2cfunccallback != NULL)
                  {
@@ -243,7 +310,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
                      i2cfunccallback(pXcode, (pvoid)pcurrentdatabuffer, 0, 0);
                  }
              }
-@@ -974,6 +1096,7 @@
+@@ -974,6 +1150,7 @@
          Wait_System_Event(pXcode, pXcode->I2cSubmitEvent, &irql);
  
          pcurrentdatabuffer = pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com;
@@ -251,7 +318,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
          i2cfunccallback = pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com->call_back;
  
          pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com->is_complete = IOCTL_RET_CMD_HW_TIMED_OUT_ERROR;
-@@ -997,6 +1120,7 @@
+@@ -997,6 +1174,7 @@
  #ifdef XC4_VIPER
      if (((temp_reg_val >> XC_I2C_HW_MUTEX_ID_SHIFT) & 0xF) == XC_I2C_INTERLOCK_DRV_ID)
      {
@@ -259,7 +326,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
          if (MMR_WRITE_CHECK (pXcode, XC_I2C_HW_MUTEX, ((XC_I2C_INTERLOCK_DRV_ID & 0xF) << XC_I2C_HW_MUTEX_ID_SHIFT)) == RET_NODEVICE)
          	return RET_NODEVICE;
  
-@@ -1129,6 +1253,7 @@
+@@ -1129,6 +1307,7 @@
      
          if (temp & temp1)
          {

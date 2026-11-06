@@ -7,6 +7,7 @@
 #   読み込み: insmod xcode4drv.ko fw_secondary=23(付けなければ純正と同じ動作)。docs/25 の 3.10
 #             dbg_i2c=1 で、I2C の要求が 5 秒たっても完了しないとき、待ち行列・レジスタ・バスごとの数え上げと直近の出来事をカーネルのログに出す
 #             (echo 1 > /sys/module/xcode4drv/parameters/dbg_i2c_dump で、数え上げとレジスタをいつでも出せる)
+#             (止まっているときだけ: echo 0 > /sys/module/xcode4drv/parameters/dbg_i2c_recover で、バス 0 を GPIO で回復させる試験)
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$ROOT/scripts/xc4drv_2629

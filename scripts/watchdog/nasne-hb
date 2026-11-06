@@ -4,6 +4,7 @@
 #   | 割り込み: IRQ6 の累計(GMAC・SATA が共有) 全体 | D 状態のプロセス数 [名前] | nasne-recpt1 の数
 #   | HDD の温度(SMART の 194/190。省電力で止まっているときは起こさず、読めなければ -)
 #   受信サーバ以外で D 状態が 1 分以上続くプロセスがあれば、/var/log/nasne-hb-dstate.log にカーネルの中の位置などを書き出す(下)。
+#   毎時 0 分に、ドライバの I2C の数え上げを kern.log に出させる(GPL 版のドライバのとき。下)。
 # 再起動のあとも読めるよう、行ごとにファイルだけ fsync する(全体の sync はしない)。5MB を超えたら .1 に回す。
 # 置き方: /usr/local/sbin/nasne-hb、/etc/cron.d/nasne-hb に「* * * * * root /usr/local/sbin/nasne-hb」
 LOG=/var/log/nasne-hb.log
@@ -43,7 +44,12 @@ for p in $cur; do
         tail -n 60 /tmp/mcui2c-trace.log 2>/dev/null
         echo "--- dmesg の末尾"
         dmesg | grep -v -e 'return_value is 6' -e 'xc_i2c_dbg' | tail -n 30
-        echo "--- ドライバの I2C の記録(xcode4drv の dbg_i2c=1 のとき)"
-        dmesg | grep 'xc_i2c_dbg' | tail -n 160
+        echo "--- ドライバの I2C の記録(xcode4drv の dbg_i2c=1 のとき。dmesg は受信の失敗の行で溢れるので kern.log から)"
+        grep 'xc_i2c_dbg' /var/log/kern.log 2>/dev/null | tail -n 200
     } | dd of=$DLOG oflag=append conv=notrunc,fsync 2>/dev/null
 done
+
+# 1 時間ごと(毎時 0 分)に、ドライバの I2C の数え上げ(割り込み・完了・エラー・遅い転送など)とレジスタを kern.log に出させる。
+# 止まる前の傾向(エラーや遅い転送が増えていくか)を見るため。GPL 版のドライバ(dbg_i2c 付き)のときだけ
+D=/sys/module/xcode4drv/parameters/dbg_i2c_dump
+[ "$(date +%M)" = 00 ] && [ -w $D ] && echo 1 > $D

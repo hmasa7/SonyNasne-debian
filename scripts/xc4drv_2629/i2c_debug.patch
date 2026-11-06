@@ -11,7 +11,25 @@ diff -ru a/kdrv/drv/Os_Linux_Init.c b/kdrv/drv/Os_Linux_Init.c
  #else
  MODULE_PARM(Diagnostic, "int");
  MODULE_PARM(Board_ID, "int");
-@@ -2453,6 +2456,20 @@
+@@ -174,6 +177,17 @@
+ PXCODEDEV pXcodeContext_Global[MAXXCODEDEV] = {
+                                        NULL
+                                        };
++#ifdef LINUX
++/* echo 1 > /sys/module/xcode4drv/parameters/dbg_i2c_dump: print the I2C counters/registers/rings now (nasne-hb does it hourly) */
++static int dbg_i2c_dump_set(const char *val, struct kernel_param *kp)
++{
++    if (pXcodeContext_Global[0] != NULL)
++        xc_i2c_dbg_report(pXcodeContext_Global[0], NULL, 0);
++    return 0;
++}
++module_param_call(dbg_i2c_dump, dbg_i2c_dump_set, NULL, NULL, 0200);
++#endif
++
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27)
+ static int boxster_vma_nopage(struct vm_area_struct *vma, struct vm_fault *vmf);
+@@ -2453,6 +2467,20 @@
                      {
  
                          //sleep the thread
@@ -35,7 +53,7 @@ diff -ru a/kdrv/drv/Os_Linux_Init.c b/kdrv/drv/Os_Linux_Init.c
 diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
 --- a/kdrv/drv/i2c.c
 +++ b/kdrv/drv/i2c.c
-@@ -22,6 +22,49 @@
+@@ -22,6 +22,119 @@
  *******************************************************************************/
  
  #include "devcontext.h"
@@ -43,49 +61,127 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
 +#include <linux/sched.h>
 +#include <linux/jiffies.h>
 +/* Debug (dbg_i2c=1): I2C requests (MCU etc.) that never complete and leave the caller asleep in D state.
-+ * Keep the last XC_I2C_TR_N I2C events in a ring and dump them with the queue state when a request is stuck. */
++ * Keep the last XC_I2C_TR_N I2C events of each block in its own ring (block 1 = tuners is busy and would push
++ * block 0 = MCU out of a shared ring), count interrupts/completions/errors per block, and dump them with the
++ * queue state and the I2C/interrupt registers when a request is stuck. Transfers slower than XC_I2C_SLOW_MS are
++ * printed as they complete (rate limited). */
 +extern int dbg_i2c;
-+#define XC_I2C_TR_N 128
-+static struct { unsigned long j; int pid; unsigned char ev, blk; unsigned int a, b; } xc_i2c_tr[XC_I2C_TR_N];
-+static unsigned int xc_i2c_tr_pos;
-+static const char *xc_i2c_ev_name[] = { "?", "start", "queued", "waited", "complete", "next", "callback", "timer" };
++#define XC_I2C_TR_N 64
++#define XC_I2C_SLOW_MS 100
++static struct { unsigned long j; int pid; unsigned char ev; unsigned int a, b; } xc_i2c_tr[I2CBLOCKMAX][XC_I2C_TR_N];
++static unsigned int xc_i2c_tr_pos[I2CBLOCKMAX];
++static struct { unsigned long start_j, last_done_j, isr, done, hwerr, cmderr, spurious, slow, max_ms, pinmux, unlock_busy; } xc_i2c_st[I2CBLOCKMAX];
++static const char *xc_i2c_ev_name[] = { "?", "start", "queued", "waited", "complete", "next", "callback", "timer",
++                                        "pre", "isr", "pinmux", "unlock", "cmdreg" };
++#define XC_I2C_EV_N (sizeof(xc_i2c_ev_name) / sizeof(xc_i2c_ev_name[0]))
 +static void xc_i2c_tr_add(int ev, int blk, unsigned int a, unsigned int b)
 +{
-+    unsigned int i = xc_i2c_tr_pos++ % XC_I2C_TR_N;
-+    xc_i2c_tr[i].j = jiffies; xc_i2c_tr[i].pid = current->pid; xc_i2c_tr[i].ev = ev; xc_i2c_tr[i].blk = blk;
-+    xc_i2c_tr[i].a = a; xc_i2c_tr[i].b = b;
++    unsigned int i;
++    if (blk < 0 || blk >= I2CBLOCKMAX) return;
++    i = xc_i2c_tr_pos[blk]++ % XC_I2C_TR_N;
++    xc_i2c_tr[blk][i].j = jiffies; xc_i2c_tr[blk][i].pid = current->pid; xc_i2c_tr[blk][i].ev = ev;
++    xc_i2c_tr[blk][i].a = a; xc_i2c_tr[blk][i].b = b;
 +}
 +#define XC_I2C_TR(ev, blk, a, b) do { if (dbg_i2c) xc_i2c_tr_add(ev, blk, (unsigned int)(a), (unsigned int)(b)); } while (0)
++static void xc_i2c_dbg_start(PXCODEDEV pXcode, uint32 blk)      /* before the command register is written */
++{
++    uint32 cmd = 0, mtx = 0;
++    if (!dbg_i2c) return;
++    MMR_READ_CHECK(pXcode, &cmd, pXcode->ProcI2cComQueue[blk].i2c_reg_offsets.command_reg_offset);
++    MMR_READ_CHECK(pXcode, &mtx, XC_I2C_HW_MUTEX);
++    xc_i2c_st[blk].start_j = jiffies;
++    xc_i2c_tr_add(8, blk, cmd, mtx);
++}
++static void xc_i2c_dbg_done(uint32 blk, uint32 completed, uint32 cmd, uint32 slave)   /* completion seen in the DPC */
++{
++    unsigned long ms;
++    if (!dbg_i2c) return;
++    ms = (jiffies - xc_i2c_st[blk].start_j) * 1000 / HZ;
++    xc_i2c_st[blk].done++; xc_i2c_st[blk].last_done_j = jiffies;
++    if (completed == IOCTL_RET_CMD_FAIL_HW_ERROR) xc_i2c_st[blk].hwerr++;
++    if (cmd & XC_I2C0_COMMAND_ERROR_MASK) xc_i2c_st[blk].cmderr++;
++    if (ms > xc_i2c_st[blk].max_ms) xc_i2c_st[blk].max_ms = ms;
++    xc_i2c_tr_add(12, blk, cmd, ms);
++    if (ms >= XC_I2C_SLOW_MS) {
++        xc_i2c_st[blk].slow++;
++        if (printk_ratelimit())
++            printk(KERN_WARNING "xc_i2c_dbg: slow block %u slave %02x %lu ms completed %d cmdreg %08x\n", blk, slave, ms, (int)completed, cmd);
++    }
++}
++static void xc_i2c_dbg_isr(PXCODEDEV pXcode, uint32 blk, uint32 st)   /* this block's bits are set in PPC_INT_STATUS */
++{
++    if (!dbg_i2c) return;
++    xc_i2c_st[blk].isr++;
++    if (pXcode->ProcI2cComQueue[blk].pcurrent_i2c_data_com == NULL) xc_i2c_st[blk].spurious++;
++    xc_i2c_tr_add(9, blk, st, pXcode->ProcI2cComQueue[blk].pcurrent_i2c_data_com != NULL);
++}
++static void xc_i2c_dbg_unlock(PXCODEDEV pXcode, uint32 mtx)           /* the HW mutex is released while a transfer is still running */
++{
++    uint32 b;
++    if (!dbg_i2c) return;
++    for (b = 0; b < I2CBLOCKMAX; b++)
++        if (pXcode->ProcI2cComQueue[b].pcurrent_i2c_data_com != NULL) {
++            xc_i2c_st[b].unlock_busy++;
++            xc_i2c_tr_add(11, b, mtx, pXcode->ProcI2cComQueue[b].current_completed);
++        }
++}
 +void xc_i2c_dbg_report(PXCODEDEV pXcode, void *pioctl, unsigned long secs)
 +{
-+    uint32 st = 0, mtx = 0, cmd, b;
-+    unsigned int n, k, pos = xc_i2c_tr_pos;
-+    printk(KERN_WARNING "xc_i2c_dbg: pid %d (%s) I2C request %p not completed after %lu s\n", current->pid, current->comm, pioctl, secs);
-+    MMR_READ_CHECK(pXcode, &st, XC_PPC_INT_STATUS);
-+    MMR_READ_CHECK(pXcode, &mtx, XC_I2C_HW_MUTEX);
-+    printk(KERN_WARNING "xc_i2c_dbg: PPC_INT_STATUS %08x I2C_HW_MUTEX %08x semaphore %d\n", st, mtx, (int)pXcode->i2c_semaphore);
++    static const struct { const char *name; uint32 off; } regs[] = {
++        { "PPC_INT_STATUS", XC_PPC_INT_STATUS }, { "PPC_HOST_INT_MASK", XC_PPC_HOST_INT_MASK },
++        { "MIPS3_INTERRUPT", XC_MIPS3_INTERRUPT }, { "MIPS3_INTERRUPT_MASK", XC_MIPS3_INTERRUPT_MASK },
++        { "I2C_HW_MUTEX", XC_I2C_HW_MUTEX }, { "GPIO_I_CTRL", XC_GPIO_I_CTRL },
++        { "I2C0_CONFIG", XC_I2C0_CONFIG }, { "I2C0_COMMAND", XC_I2C0_COMMAND },
++        { "I2C1_CONFIG", XC_I2C1_CONFIG }, { "I2C1_COMMAND", XC_I2C1_COMMAND },
++    };      /* status/config/command only: the data registers are FIFOs and are not read */
++    uint32 v, b;
++    unsigned int n, k, r;
++    if (pioctl)
++        printk(KERN_WARNING "xc_i2c_dbg: pid %d (%s) I2C request %p not completed after %lu s (semaphore %d)\n",
++               current->pid, current->comm, pioctl, secs, (int)pXcode->i2c_semaphore);
++    else        /* on demand (dbg_i2c_dump): counters and registers only */
++        printk(KERN_WARNING "xc_i2c_dbg: dump (semaphore %d)\n", (int)pXcode->i2c_semaphore);
++    for (r = 0; r < sizeof(regs) / sizeof(regs[0]); r++) {
++        v = 0;
++        MMR_READ_CHECK(pXcode, &v, regs[r].off);
++        printk(KERN_WARNING "xc_i2c_dbg: reg %s (%04x) %08x\n", regs[r].name, (unsigned int)regs[r].off, v);
++    }
 +    for (b = 0; b < I2CBLOCKMAX; b++) {
-+        cmd = 0;
-+        MMR_READ_CHECK(pXcode, &cmd, pXcode->ProcI2cComQueue[b].i2c_reg_offsets.command_reg_offset);
-+        printk(KERN_WARNING "xc_i2c_dbg: block %u current %p completed %d head %u tail %u full %u cmdreg %08x\n", b,
++        printk(KERN_WARNING "xc_i2c_dbg: block %u current %p completed %d head %u tail %u full %u started %lu ms ago, last done %lu ms ago\n", b,
 +               pXcode->ProcI2cComQueue[b].pcurrent_i2c_data_com, (int)pXcode->ProcI2cComQueue[b].current_completed,
 +               (unsigned int)pXcode->ProcI2cComQueue[b].head, (unsigned int)pXcode->ProcI2cComQueue[b].tail,
-+               (unsigned int)pXcode->ProcI2cComQueue[b].full, cmd);
-+    }
-+    n = pos < XC_I2C_TR_N ? pos : XC_I2C_TR_N;
-+    for (k = pos - n; k != pos; k++) {
-+        unsigned int i = k % XC_I2C_TR_N;
-+        printk(KERN_WARNING "xc_i2c_dbg: [-%lu ms] pid %d %s blk %u a %x b %x\n", (long)(jiffies - xc_i2c_tr[i].j) * 1000 / HZ,
-+               xc_i2c_tr[i].pid, xc_i2c_tr[i].ev < 8 ? xc_i2c_ev_name[xc_i2c_tr[i].ev] : "?", xc_i2c_tr[i].blk, xc_i2c_tr[i].a, xc_i2c_tr[i].b);
++               (unsigned int)pXcode->ProcI2cComQueue[b].full,
++               (jiffies - xc_i2c_st[b].start_j) * 1000 / HZ, (jiffies - xc_i2c_st[b].last_done_j) * 1000 / HZ);
++        printk(KERN_WARNING "xc_i2c_dbg: block %u counts isr %lu done %lu hwerr %lu cmderr %lu spurious %lu slow %lu max %lu ms pinmux %lu unlock_busy %lu\n", b,
++               xc_i2c_st[b].isr, xc_i2c_st[b].done, xc_i2c_st[b].hwerr, xc_i2c_st[b].cmderr, xc_i2c_st[b].spurious,
++               xc_i2c_st[b].slow, xc_i2c_st[b].max_ms, xc_i2c_st[b].pinmux, xc_i2c_st[b].unlock_busy);
++        n = !pioctl ? 0 : xc_i2c_tr_pos[b] < XC_I2C_TR_N ? xc_i2c_tr_pos[b] : XC_I2C_TR_N;
++        for (k = xc_i2c_tr_pos[b] - n; k != xc_i2c_tr_pos[b]; k++) {
++            unsigned int i = k % XC_I2C_TR_N;
++            printk(KERN_WARNING "xc_i2c_dbg: blk %u [-%lu ms] pid %d %s a %x b %x\n", b, (jiffies - xc_i2c_tr[b][i].j) * 1000 / HZ,
++                   xc_i2c_tr[b][i].pid, xc_i2c_tr[b][i].ev < XC_I2C_EV_N ? xc_i2c_ev_name[xc_i2c_tr[b][i].ev] : "?", xc_i2c_tr[b][i].a, xc_i2c_tr[b][i].b);
++        }
 +    }
 +}
 +#else
 +#define XC_I2C_TR(ev, blk, a, b) do { } while (0)
++#define xc_i2c_dbg_start(p, b) do { } while (0)
++#define xc_i2c_dbg_done(b, c, r, s) do { } while (0)
++#define xc_i2c_dbg_isr(p, b, s) do { } while (0)
++#define xc_i2c_dbg_unlock(p, m) do { } while (0)
 +#endif
  
  /* Defines */
  
-@@ -516,6 +559,7 @@
+@@ -431,6 +544,7 @@
+ 			if ( gpio_i_ctrl & gpio_i_i2c_mask )
+ 			{
+ 				//PDEBUG("i2c_submit_command() reset GPIO_I_CTRL(0x%x -> 0x%x) for I2C control\n", gpio_i_ctrl, (gpio_i_ctrl & ~gpio_i_i2c_mask));
++				if (dbg_i2c) { xc_i2c_st[i2cblock].pinmux++; XC_I2C_TR(10, i2cblock, gpio_i_ctrl, 0); }
+ 				gpio_i_ctrl &= ~gpio_i_i2c_mask;
+ 				
+ 				if (MMR_WRITE_CHECK(pXcode, XC_GPIO_I_CTRL, gpio_i_ctrl) == RET_NODEVICE)
+@@ -516,6 +630,7 @@
          pXcode->ProcI2cComQueue[i2cblock].pcurrent_i2c_data_com = pI2cDataComBuffer;
  
          pXcode->ProcI2cComQueue[i2cblock].current_completed = IOCTL_RET_CMD_PROCESSING;
@@ -93,7 +189,15 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
  
          //first reset the hw read and write pointers
          //reset not required for spyder
-@@ -674,11 +718,13 @@
+@@ -590,6 +705,7 @@
+ #endif
+ //        KdPrint(("pXcode->ProcI2cComQueue[i2cblock].i2c_reg_offsets.config_reg_offset = %x\n", pXcode->ProcI2cComQueue[i2cblock].i2c_reg_offsets.config_reg_offset));
+ 
++        xc_i2c_dbg_start(pXcode, i2cblock);
+         //set up command register
+         temp1 = 0;
+         temp = pXcode->ProcI2cComQueue[i2cblock].pcurrent_i2c_data_com->slave_address;
+@@ -674,11 +790,13 @@
              checkdpc = 0;
          }
          checkdpc = 1;
@@ -107,7 +211,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
      }
  
  
-@@ -774,6 +820,7 @@
+@@ -774,6 +892,7 @@
                  pXcode->i2c_semaphore--;
  
                  pcurrentdatabuffer = pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com;
@@ -115,7 +219,15 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
                  i2cfunccallback = pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com->call_back;
                  pXcode->ProcI2cComQueue[count1].pcurrent_i2c_data_com->is_complete = IOCTL_RET_CMD_COMPLETE;
  
-@@ -941,6 +988,7 @@
+@@ -792,6 +911,7 @@
+                     //return RET_NODEVICE;
+                 }
+ #endif
++                xc_i2c_dbg_done(count1, pXcode->ProcI2cComQueue[count1].current_completed, temp, pcurrentdatabuffer->slave_address);
+                 if (pXcode->ProcI2cComQueue[count1].current_completed == IOCTL_RET_CMD_FAIL_HW_ERROR)
+                 {
+ #ifdef VIXS_USBD
+@@ -941,6 +1061,7 @@
                      PI2CDATACOMBUFFER pTemp;
                      
                      PDEBUG("process i2c command in queue\n");
@@ -123,7 +235,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
  
                      pXcode->ProcI2cComQueue[count1].full = I2CQUEUEEMPTY;
                      pTemp = pXcode->ProcI2cComQueue[count1].i2c_func_call_buffer[pXcode->ProcI2cComQueue[count1].tail].pi2c_data_com_buffer;
-@@ -960,6 +1008,7 @@
+@@ -960,6 +1081,7 @@
  
                  if ( i2cfunccallback != NULL)
                  {
@@ -131,7 +243,7 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
                      i2cfunccallback(pXcode, (pvoid)pcurrentdatabuffer, 0, 0);
                  }
              }
-@@ -974,6 +1023,7 @@
+@@ -974,6 +1096,7 @@
          Wait_System_Event(pXcode, pXcode->I2cSubmitEvent, &irql);
  
          pcurrentdatabuffer = pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com;
@@ -139,3 +251,19 @@ diff -ru a/kdrv/drv/i2c.c b/kdrv/drv/i2c.c
          i2cfunccallback = pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com->call_back;
  
          pXcode->ProcI2cComQueue[BlockId].pcurrent_i2c_data_com->is_complete = IOCTL_RET_CMD_HW_TIMED_OUT_ERROR;
+@@ -997,6 +1120,7 @@
+ #ifdef XC4_VIPER
+     if (((temp_reg_val >> XC_I2C_HW_MUTEX_ID_SHIFT) & 0xF) == XC_I2C_INTERLOCK_DRV_ID)
+     {
++        xc_i2c_dbg_unlock(pXcode, temp_reg_val);
+         if (MMR_WRITE_CHECK (pXcode, XC_I2C_HW_MUTEX, ((XC_I2C_INTERLOCK_DRV_ID & 0xF) << XC_I2C_HW_MUTEX_ID_SHIFT)) == RET_NODEVICE)
+         	return RET_NODEVICE;
+ 
+@@ -1129,6 +1253,7 @@
+     
+         if (temp & temp1)
+         {
++            xc_i2c_dbg_isr(pXcode, count, temp);
+             if (pXcode->ProcI2cComQueue[count].pcurrent_i2c_data_com != (pvoid) 0)
+             {
+                 if ( (count == I2CBLOCK0 && (temp & (XC_PPC_INT_STATUS_I2C0_ARB_FAIL_MASK | XC_PPC_INT_STATUS_I2C0_BUSY_ERROR_MASK)))

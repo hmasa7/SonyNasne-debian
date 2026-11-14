@@ -12,6 +12,7 @@
 | HDD が壊れた/交換したい。**Debian は要らない**(純正のまま戻したい) | [§1-A](#a-hdd-の復旧純正のまま) |
 | 純正のまま、SPI の中身を**保存だけ**しておきたい(保険) | [§1-B](#b-spi-のバックアップ読むだけ) |
 | nasne で **Debian を動かしたい**(まず試す、実績が多いほう) | [§1-C](#c-debian-を動かす安定版-linux-2629--debian-7) |
+| **とにかく最短で Debian + テレビまで行きたい**(おすすめコース) | [docs/13](13_full_setup_from_official_hdd.md)(全体像は [README](../README.md) の「まず試すなら」、位置づけは [§1-C](#c-debian-を動かす安定版-linux-2629--debian-7)) |
 | nasne で **新しいカーネル(6.12)+ Debian 12** を試したい | [§1-D](#d-新しいカーネルlinux-612-debian-12試験中) |
 | **テレビを見たい/録画したい**(Mirakurun・EPGStation・tvheadend・VLC など) | [§1-E](#e-テレビを見る録る) |
 | 状態を監視したい/Samba のファイルサーバーにしたい/自動起床したい | [§1-F](#f-運用の周辺状態ファイル共有起床) |
@@ -39,6 +40,7 @@
 |---|---|---|
 | nasne 自身に SPI を読ませて HDD に保存する(書き込みなし) | [docs/16](16_spi_backup_dlm.md) | 公式 HDD の `00550066.dlm` を 1 ファイル差し替えるだけ。CH341A は不要。**以降のどの SPI 書き換えの前にも推奨** |
 | CH341A 等で外から全域をダンプする | [docs/05](05_kernel_and_direct_boot.md)(`flashrom` での読み出し・書き込み) | 基板にクリップを付ける必要あり。最も確実 |
+| 純正のまま、公式アップデート機能で自作 `.dlm` を適用する(HDD を開けない) | [docs/25](25_official_update_push.md) | 公式の適用処理に書かせる。版ゲート(現行より新しい版が必須)と sys1 の空き容量が前提 |
 
 ### C. Debian を動かす(安定版: Linux 2.6.29 + Debian 7)
 
@@ -71,7 +73,7 @@
 | VLC などで見る | [docs/11](11_tv_streaming.md)(`/playlist.m3u8`) | ワンセグは対象外 |
 | Mirakurun + EPGStation で予約録画 | [contrib/epgstation](../contrib/epgstation/README.md) | Docker。Mirakurun の `/app-config` と `/app-data` は**両方**永続化([docs/11](11_tv_streaming.md)) |
 | tvheadend で予約録画 | [contrib/tvheadend](../contrib/tvheadend/README.md) | IPTV(M3U)で登録 |
-| BS/CS を使う | [docs/11](11_tv_streaming.md)(`--scan-all`/`/scan?all`、`nasne_mirakurun_conf.py --sat`) | 受信できる環境の報告あり([docs/20](20_compatibility_and_reports.md))。既定は**チューナー 1 系統**(同時視聴は不可)。地デジ+BS/CS の同時受信は試験的に可能([docs/11](11_tv_streaming.md) の `--dual-tuner`) |
+| BS/CS を使う | [docs/11](11_tv_streaming.md)(`--scan-all`/`/scan?all`、`nasne_mirakurun_conf.py --sat`) | 受信できる環境の報告あり([docs/20](20_compatibility_and_reports.md))。既定は**チューナー 1 系統**。地デジ+BS/CS の同時受信は `--dual-tuner` で可能(成立を確認済み。既知の問題あり。[docs/11](11_tv_streaming.md)) |
 | KonomiTV など別のアプリで見る | [docs/11](11_tv_streaming.md)・[docs/20](20_compatibility_and_reports.md) | 実視聴の報告あり |
 | B-CAS・TS のしくみ | [docs/12](12_ts_and_bcas_decrypt.md)・[docs/07](07_driver_ioctl_bcas.md) | 読み物 |
 | 受信がおかしい(busy・503・映像が乱れる) | [docs/21](21_troubleshooting.md)・[docs/11](11_tv_streaming.md)「トラブルシュート」 | TS の中身の検査は `scripts/tools/ts_analyze.py`([docs/09](09_tools.md))で、PAT/PMT・PID ごとの CC エラー・スクランブル・TEI を見る |

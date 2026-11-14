@@ -16,6 +16,18 @@ SIE(旧SCE)製ネットワークレコーダー **nasne CECH-ZNR2J**(初期型�
 
 **[docs/00_where_to_start.md](docs/00_where_to_start.md)**: 「何をしたいか」「どのバージョン(カーネル・Debian・本体のモデル)か」「何を入れたいか」「どこまで触るか」から、読む手順書を選べる振り分けリストです。
 
+## まず試すなら(おすすめコース)
+
+「公式ファームで動いている nasne を Debian 化して、テレビの受信まで使いたい」という、いちばん多いコースの全体像です。
+
+1. **SPI のバックアップを取る**(保険。以後のどの作業でも先にこれ): [docs/16](docs/16_spi_backup_dlm.md)
+2. **PC で `.dlm` を作る**(カーネル・Debian ツリー・`.dlm` を `nasne_setup.py` の 1 コマンドで): [docs/13](docs/13_full_setup_from_official_hdd.md)
+3. **HDD に入れて、nasne に挿して電源を入れる**(約 5 分で Debian が起動): [docs/13](docs/13_full_setup_from_official_hdd.md)
+4. **ssh で入って確認する**(ログインできれば導入は完了): [docs/13](docs/13_full_setup_from_official_hdd.md)
+5. **テレビを見る・録る設定をする**: [docs/11](docs/11_tv_streaming.md)(受信・配信)、[contrib/epgstation](contrib/epgstation/README.md)(Mirakurun + EPGStation で予約録画)
+
+途中で止まったら [docs/21](docs/21_troubleshooting.md)、自分の機体・HDD で確認できているかは [docs/20](docs/20_compatibility_and_reports.md) です。他の目的(新しいカーネルを試す、HDD の復旧だけ、元に戻す等)は上の振り分けリスト([docs/00](docs/00_where_to_start.md))から選んでください。
+
 ## HDDが壊れて、復旧したいだけの方へ
 
 **[docs/04_hdd_recovery_guide.md](docs/04_hdd_recovery_guide.md)** を読んでください。HDDの区画作成とファイルのコピーだけで、
@@ -47,7 +59,7 @@ SIE(旧SCE)製ネットワークレコーダー **nasne CECH-ZNR2J**(初期型�
 | ✅ できる | 【CFW共通】 **Sambaのファイルサーバー**(オプション。`/data` をSMBで共有。SMB2でログイン・読み書きを確認。[contrib/samba](contrib/samba/README.md)) |
 | △ 試験中(非推奨) | 【新】 **新しいカーネル(Linux 6.12 LTS)+ Debian 12**(SPI からの単独起動、SATA・Ethernet・MTD・MCU、**地デジの受信と B-CAS 復号(xcode4drv を 6.12 に移植)**、LED・電源ボタン・電源断と起床タイマ・状態ページ、**USB ホスト(USB メモリの ext4/vfat・ホットプラグ・USB マウス)**、スワップ、SysRq まで動く。**一応使えますが、非推奨です**(普段使いは旧カーネル版へ)。**SPI を書き換えるので、失敗したときに自分で復旧できる方(CH341A などの外付けの書き込み器と、書き戻しの知識がある方)向け**です。自己責任で試して、**結果を [Issue](../../issues/new/choose) で教えてください**(動いた場合も歓迎)。BS/CS は 6.12 では未確認。[docs/22](docs/22_new_kernel_612.md)、カーネルの機能一覧は [docs/23](docs/23_kernel_feature_inventory.md)) |
 | 🟡 他の人の報告 | 【CFW共通】 **BS/CS110 の受信**(`nasne-recpt1` が `BS1`〜`BS23`・`CS2`〜`CS24` を指定できる。他の人の実機で受信できた報告をもとに取り込んだもので、作者の環境では未検証。`/scan?all` で BS/CS も一覧化でき、`nasne_mirakurun_conf.py --sat --scan` で Mirakurun の設定を作れる(PR #5)。Mirakurun で使うときのチャンネル名の決まりは [docs/11](docs/11_tv_streaming.md)・[contrib/epgstation](contrib/epgstation/README.md)) |
-| △ 未検証 | 【固定】 2つ目のチューナー、複数番組の同時視聴(チューナーは1系統) |
+| ⚠️ できる(条件つき) | 【CFW共通】 **地デジと BS/CS の同時視聴・同時録画**(`--dual-tuner` で地デジ1番組+BS/CS 1番組。報告者の実電波環境で成立を確認。同じ系統の2番組は同時にできない。既知の問題: ザッピングの連続切断で待機プロセスが増殖する問題(系統ごとの担当プロセス方式へ移行中)と、後着セッションの映像・音声の開始が遅れる問題。[docs/11](docs/11_tv_streaming.md)、[Issue #12](https://github.com/mar1mo-41414/SonyNasne-debian/issues/12)) |
 | ✅ できる | 【CFW共通】 **前面LED**(PWR=緑、異常を報告している間だけ赤。REC=チューナー使用中、LAN=ネットワーク確立で点灯のまま。[docs/06](docs/06_mcu_watchdog.md)) |
 | ✅ できる | 【CFW共通】 **電源オフ・起床タイマ・電源ボタン長押しでの停止**(`poweroff` がMCUへ電源断コマンドを送る。長押しで電源オフ。LANからの電源ONは不可で、起床タイマで代替。[docs/06](docs/06_mcu_watchdog.md)) |
 | ❌ できない | 【固定】 UART/JTAGによるデバッグ(基板に未実装) |
@@ -104,6 +116,8 @@ nasne(Debian直起動)がLANに出すものと、その認証です。**どれ�
 | [15_p3_structure_and_hai](docs/15_p3_structure_and_hai.md) | p3の初期構造と `.hai`(v1.00なしで復旧できる理由) |
 | [16_spi_backup_dlm](docs/16_spi_backup_dlm.md) | SPIフラッシュを読むだけでバックアップする `.dlm`、バックアップへ戻す `.dlm` |
 | [17_official_web_api](docs/17_official_web_api.md) | 公式Web APIの呼び方(認証トークン、LED制御、初期化API) |
+| [25_official_update_push](docs/25_official_update_push.md) | 公式アップデート経路でカスタム .dlm を適用する(push方式。前提・版ゲート・容量・エラーコード表) |
+| [26_media_engine_firmware](docs/26_media_engine_firmware.md) | メディアエンジンのファーム(ARC)の解析と、secondary プールの上限(22 個)を広げる対策 `fw_secondary`(Issue #14) |
 | [18_status_page](docs/18_status_page.md) | 状態ページ(HDD温度・SMART・メモリ・ディスク・MCU・チューナー。HTTP、JSON、Prometheus) |
 | [19_new_kernel_survey](docs/19_new_kernel_survey.md) | 新しいカーネル(6.x)を作るために必要な情報の調査(ベンダーソースの実測、移植の対象、`xcode4drv`、デバッグの進め方) |
 | [20_compatibility_and_reports](docs/20_compatibility_and_reports.md) | **対応状況のマトリクス**(モデル・ファーム・HDD・機能)と、検証結果の報告のしかた(個体情報を出さない `nasne-report`) |
@@ -153,6 +167,7 @@ nasne(Debian直起動)がLANに出すものと、その認証です。**どれ�
    ├─ fetch_gpl_sources.sh    … SIE公開のGPLソースの取得
    ├─ kernel_build/           … 自前カーネルのビルド(Docker)と内蔵initramfs
    ├─ stage1/                 … 公式HDDの00550066.dlm差し替えだけでDebian直起動へ移行するツール一式
+   ├─ push/                   … 公式アップデート経路で .dlm を適用する (nasne_push.py とテスト)
    ├─ watchdog/               … MCUウォッチドッグ停止(mcui2c、initサービス)
    ├─ newkernel/              … 新カーネル(6.12)用の rootfs 作成・導入・サービス(Debian 12)
    ├─ tools/                  … 実機用のツール(`nasne-recpt1`(TS取得・HTTP配信)、I2C、ioctl、/dev/mem、MTD書き込み、B-CAS)

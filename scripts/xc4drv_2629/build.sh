@@ -4,7 +4,7 @@
 #   前提: scripts/fetch_gpl_sources.sh、docker build -t nasne-kcc:gcc432 scripts/kernel_build、
 #         NASNE_CUSTOM=1 sh scripts/kernel_build/build.sh で gpl_src/build/mips-linux-2.6.29 をビルド済み(実機のカーネルと同じ設定)
 #   使い方: sh scripts/xc4drv_2629/build.sh [出力ファイル(既定 gpl_src/build/xcode4drv.ko)]
-#   読み込み: insmod xcode4drv.ko fw_secondary=23(付けなければ純正と同じ動作)。docs/25 の 3.10
+#   読み込み: insmod xcode4drv.ko fw_secondary=24(付けなければ純正と同じ動作。推奨値は 24)。docs/26 の 3.10・3.11
 #             dbg_i2c=1 で、I2C の要求が 5 秒たっても完了しないとき、待ち行列・レジスタ・バスごとの数え上げと直近の出来事をカーネルのログに出す
 #             (echo 1 > /sys/module/xcode4drv/parameters/dbg_i2c_dump で、数え上げとレジスタをいつでも出せる)
 #             (止まっているときだけ: echo 0 > /sys/module/xcode4drv/parameters/dbg_i2c_recover で、バス 0 を GPIO で回復させる試験)

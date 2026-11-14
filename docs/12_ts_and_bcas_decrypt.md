@@ -86,7 +86,7 @@
 | `+0x198` | `ca_pmt_command_id` |
 | `+0x19c` | `securedts_mode` |
 
-`+0x17c`〜`+0x198` は、ファームの構造体の並び(SDK の `mipshost.h`)と既知の 4 欄(`+0x178`・`+0x184`・`+0x194`・`+0x19c`)の位置から決めた([docs/25](25_media_engine_firmware.md))。
+`+0x17c`〜`+0x198` は、ファームの構造体の並び(SDK の `mipshost.h`)と既知の 4 欄(`+0x178`・`+0x184`・`+0x194`・`+0x19c`)の位置から決めた([docs/26](26_media_engine_firmware.md))。
 `program_number`(`+0x194`)はファームが実際の番組と照合していて、別の値を入れると何も出力されない。`numOfDecrypter`(割り当てた復号器の数)は、Linux 版のドライバではユーザー側に書き戻されない。
 
 | offset | 内容(続き) |

@@ -1160,6 +1160,184 @@ static void send_headers(int sock) {
     sys3(4004, sock, (long)h, slen(h));
 }
 
+/* ---- ?raw=1&sid=…: 対象サービスに要る PID だけを、スクランブルのまま出す ----
+ * raw=1 は PSI ストリーム(中継器まるごと、BS で約 34Mbps)を素通しするため、今の配信の上限(17〜20Mbps)を超える。
+ * sid が付いているときは、次の PID だけを通す(約 8Mbps):
+ *   固定: PAT(0)・CAT(1)・NIT(0x10)・SDT/BAT(0x11)・EIT(0x12・0x26・0x27)・RST(0x13)・TDT/TOT(0x14)・0x23・0x24・CDT(0x28)
+ *         (is_si_pid と同じ集合に CAT を足したもの。EMM は通さない)
+ *   動的: PAT から引いた対象サービスの PMT、その PMT の PCR・全 ES(映像・音声・字幕・データ放送など)、
+ *         CA 記述子(タグ 9)が指す ECM(番組レベル・ES レベルの両方。CA_system_id は問わない)
+ * PAT・PMT は PSI ストリームの中で、そのつど組み立て直して解析する(discover() を使わない。ヘッダを先に返し、PAT・PMT も捨てずに出すため)。
+ * PMT の CRC が変わったら(版の更新・ES の増減)、動的な集合を作り直す。PMT が届くまでは固定の集合だけが出る。
+ * PAT は対象サービス(と番号 0 = NIT)だけの表に書き換える(Mirakurun 側でも絞られるので必須ではない。1 パケットに収まらない PAT は書き換えない)。
+ * 復号はしない(スクランブルのまま。transport_scrambling_control にも触らない)。 */
+static unsigned long raw_base[256], raw_dyn[256];
+static unsigned long raw_sid, raw_pmt_pid = 0x2000, raw_pmt_crc;
+static unsigned char rawpat_buf[188];
+static unsigned long raw_vpid;            /* PMT の最初の映像 ES の PID(0=未定) */
+static long split_pid_c = 0, split_fd = -1; static unsigned long split_vpid; static int split_failed;
+static void pidmap_clr(unsigned long *m) { int i; for (i = 0; i < 256; i++) m[i] = 0; }
+static void pidmap_set(unsigned long *m, unsigned long pid) { if (pid < 0x1fff) m[pid >> 5] |= 1UL << (pid & 31); }
+static int pidmap_has(const unsigned long *m, unsigned long pid) { return (m[(pid >> 5) & 255] >> (pid & 31)) & 1; }
+static void raw_filter_init(unsigned long sid) {
+    static const unsigned short fixed[] = { 0x00, 0x01, 0x10, 0x11, 0x12, 0x13, 0x14, 0x23, 0x24, 0x26, 0x27, 0x28 };
+    unsigned long i;
+    pidmap_clr(raw_base); pidmap_clr(raw_dyn);
+    for (i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) pidmap_set(raw_base, fixed[i]);
+    raw_sid = sid; raw_pmt_pid = 0x2000; raw_pmt_crc = 0; raw_vpid = 0;
+    split_pid_c = 0; split_fd = -1; split_vpid = 0; split_failed = 0;
+    sec_nsec = 2; sec_pid[0] = 0; sec_have[0] = 0; sec_pid[1] = 0x2000; sec_have[1] = 0;   /* feed() の組み立て枠を借りる([0]=PAT、[1]=PMT) */
+}
+static unsigned long sec_len_ok(unsigned long i) {      /* 組み立て済みの節の長さ(CRC 込み)。不完全・壊れていれば 0 */
+    unsigned long ln;
+    if (!sec_complete(i)) return 0;
+    ln = (((sec_buf[i][1] & 0xf) << 8) | sec_buf[i][2]) + 3;
+    if (ln < 12 || ln > sizeof(sec_buf[0])) return 0;
+    if (crc32_mpeg(sec_buf[i], ln) != 0) return 0;      /* CRC 込みで計算すると 0 になる */
+    return ln;
+}
+static void raw_parse_pat(void) {
+    unsigned long ln = sec_len_ok(0), j; unsigned char *s = sec_buf[0];
+    sec_have[0] = 0;
+    if (!ln || s[0] != 0x00) return;
+    for (j = 8; j + 4 <= ln - 4; j += 4) {
+        unsigned long pn = (s[j] << 8) | s[j + 1], pid = ((s[j + 2] & 0x1f) << 8) | s[j + 3];
+        if (pn != raw_sid || pid == raw_pmt_pid) continue;
+        lgx("raw sid: pmt pid", pid);
+        raw_pmt_pid = pid; raw_pmt_crc = 0;
+        sec_pid[1] = pid; sec_have[1] = 0;
+        pidmap_clr(raw_dyn); pidmap_set(raw_dyn, pid);
+        return;
+    }
+}
+static void raw_add_ca(const unsigned char *d, unsigned long n) {     /* 記述子の並びから CA 記述子(タグ 9)の CA_PID を足す */
+    unsigned long e;
+    for (e = 0; e + 2 <= n && e + 2 + d[e + 1] <= n; e += 2 + d[e + 1])
+        if (d[e] == 9 && d[e + 1] >= 4) pidmap_set(raw_dyn, ((d[e + 4] & 0x1f) << 8) | d[e + 5]);
+}
+static void raw_parse_pmt(void) {
+    unsigned long ln = sec_len_ok(1), pil, e, crc, i, cnt = 0; unsigned char *s = sec_buf[1];
+    sec_have[1] = 0;
+    if (!ln || s[0] != 0x02 || (unsigned long)((s[3] << 8) | s[4]) != raw_sid) return;
+    crc = ((unsigned long)s[ln - 4] << 24) | ((unsigned long)s[ln - 3] << 16) | ((unsigned long)s[ln - 2] << 8) | s[ln - 1];
+    if (crc == raw_pmt_crc) return;
+    raw_pmt_crc = crc;
+    pil = ((s[10] & 0xf) << 8) | s[11];
+    if (12 + pil > ln - 4) return;
+    pidmap_clr(raw_dyn);
+    pidmap_set(raw_dyn, raw_pmt_pid);
+    pidmap_set(raw_dyn, ((s[8] & 0x1f) << 8) | s[9]);                        /* PCR(0x1fff=無しは pidmap_set が無視) */
+    raw_add_ca(s + 12, pil);                                                 /* 番組レベルの ECM */
+    raw_vpid = 0;
+    for (e = 12 + pil; e + 5 <= ln - 4; ) {
+        unsigned long eil = ((s[e + 3] & 0xf) << 8) | s[e + 4];
+        if (e + 5 + eil > ln - 4) break;
+        if (!raw_vpid && (s[e] == 0x02 || s[e] == 0x1b || s[e] == 0x24)) raw_vpid = ((s[e + 1] & 0x1f) << 8) | s[e + 2];     /* MPEG-2・H.264・H.265 */
+        pidmap_set(raw_dyn, ((s[e + 1] & 0x1f) << 8) | s[e + 2]);            /* ES */
+        raw_add_ca(s + e + 5, eil);                                          /* ES レベルの ECM */
+        e += 5 + eil;
+    }
+    for (i = 0; i < 256; i++) { unsigned long v = raw_dyn[i]; while (v) { cnt += v & 1; v >>= 1; } }
+    lgx("raw sid: pmt 更新 pid 数", cnt);
+}
+/* PAT を対象サービス(+番号 0)だけの表にしたパケットを返す。想定と違う形なら元のパケットを返す */
+static const unsigned char *raw_rewrite_pat(const unsigned char *q) {
+    unsigned long afc = (q[3] >> 4) & 3, off = 4, soff, total, j, n = 8, i, crc; const unsigned char *sec; unsigned char *w;
+    if (!(q[1] & 0x40) || !(afc & 1)) return q;
+    if (afc & 2) { off = 5 + q[4]; if (off >= 188) return q; }
+    if (q[off] != 0) return q;                         /* pointer_field が 0 の形だけ */
+    soff = off + 1;
+    if (soff + 16 > 188) return q;
+    sec = q + soff;
+    if (sec[0] != 0x00) return q;
+    total = (((sec[1] & 0xf) << 8) | sec[2]) + 3;
+    if (total < 16 || soff + total > 188 || crc32_mpeg(sec, total) != 0) return q;
+    for (i = 0; i < soff; i++) rawpat_buf[i] = q[i];
+    w = rawpat_buf + soff;
+    for (i = 0; i < 8; i++) w[i] = sec[i];
+    for (j = 8; j + 4 <= total - 4; j += 4) {
+        unsigned long pn = (sec[j] << 8) | sec[j + 1];
+        if (pn == 0 || pn == raw_sid) { for (i = 0; i < 4; i++) w[n + i] = sec[j + i]; n += 4; }
+    }
+    if (n == 8 || n == total - 4) return q;            /* 対象が無い、または元から絞られている */
+    w[1] = (sec[1] & 0xf0) | (((n + 1) >> 8) & 0x0f); w[2] = (n + 1) & 0xff;   /* section_length = (n - 3) + 4 */
+    crc = crc32_mpeg(w, n);
+    w[n] = (crc >> 24) & 0xff; w[n + 1] = (crc >> 16) & 0xff; w[n + 2] = (crc >> 8) & 0xff; w[n + 3] = crc & 0xff;
+    for (i = soff + n + 4; i < 188; i++) rawpat_buf[i] = 0xff;
+    return rawpat_buf;
+}
+/* ---- ?raw=1&sid=… の映像の分離(衛星) ----
+ * PSI ストリームは、ファームから約 20ms に 1 枠(64KB)ずつしか渡されず、1 本で出せるのは約 21Mbps まで。超えた分はファームの中で落ちる
+ * (CS は中継器まるごとで約 35Mbps あり、毎秒 100 回以上の CC の抜けが、全 PID に一様に出る)。
+ * 同じ入力に、1 PID だけに絞った PSI ストリーム(in_vpid)をもう 1 本開くと、その PID は主のストリームから外れて、そちらにだけ流れる
+ * (1 つの PID は 1 本のストリームにしか流れない。実測)。対象サービスの映像(約 8Mbps)をこの方法で分けると、主は約 27Mbps になるが、
+ * 2 本が動いているとファームの受け渡しが速くなり(読み出しが毎秒約 41 回 → 約 52 回)、CS2 で CC の抜けが 0 になった。
+ * 2 本目は子プロセスが開いて読み(ドライバの fd を共有するのでハンドルが使える。1 本の ioctl が最大 20ms 待つので、1 つのループで 2 本は読めない)、
+ * 映像のパケットを SOCK_SEQPACKET のソケットペアで親に渡す(1 回の書き込みが 1 メッセージのまま届く)。親は主の受信の合間に、非ブロッキングで受け取って出す。
+ * 2 本目を開けない(ファームの資源・連続メモリの不足)ときは、子が何も送らずに終わり、親は主のストリームだけで続ける(映像は主に流れたまま)。 */
+#define SYS_socketpair 4184
+#define SYS_fcntl      4055
+static unsigned long ob_sp[0x484 / 4 + 4], rb_sp[0x230 / 4 + 4];
+static unsigned char split_buf[0x10000];
+static void split_child(int is_sat, unsigned long vpid, long sfd) {
+    unsigned long h0, h1, prev = 0xff, n = 0;
+    stop_flag = 0;
+    { long bs = 0x80000; sys6(4181, sfd, 0xffff, 0x1001, (long)&bs, 4, 0); }      /* SOL_SOCKET(MIPS=0xffff), SO_SNDBUF(MIPS=0x1001): 親が少し遅れても子が止まらないように */
+    clr(ob_sp, 0x484 / 4 + 2);
+    ob_sp[0xac / 4] = 0x800000; ob_sp[0xbc / 4] = is_sat ? 1 : 0; ob_sp[0xc8 / 4] = vpid; ob_sp[0xd0 / 4] = 0x10000;
+    if (ioc(ob_sp, 0x484, 0x2d, 2000) != 1) { lgx("raw split: 2 本目を開けない rv", ob_sp[3]); return; }
+    h0 = ob_sp[0xa4 / 4]; h1 = ob_sp[0xa8 / 4];
+    lgx("raw split: 2 本目 opened pid", vpid);
+    while (!stop_flag) {
+        unsigned long idx, sz;
+        clr(rb_sp, 0x230 / 4);
+        rb_sp[0xa4 / 4] = h0; rb_sp[0xa8 / 4] = h1; rb_sp[0xac / 4] = 0x20000; rb_sp[0xbc / 4] = 0x10000; rb_sp[0x144 / 4] = prev;
+        if (ioc(rb_sp, 0x230, 0x14, 200) != 1) continue;
+        idx = rb_sp[0x13c / 4]; sz = rb_sp[0xbc / 4];
+        if (idx >= 8 || sz < 188 || !ob_sp[0x1b8 / 4 + idx]) continue;
+        prev = idx;
+        if (sys3(SYS_write, sfd, (long)ob_sp[0x1b8 / 4 + idx], sz - sz % 188) <= 0) break;     /* 親が閉じた(EPIPE) */
+        n++;
+    }
+    lgx("raw split: 2 本目 recv", n);
+    clr(tb, 0xb4 / 4 + 2); tb[0xa4 / 4] = h0; tb[0xa8 / 4] = h1; ioc(tb, 0xb4, 0x11, 5000);
+}
+static void split_stop(void) {
+    unsigned long w;
+    if (split_fd >= 0) { sys3(SYS_close, split_fd, 0, 0); split_fd = -1; }
+    if (split_pid_c > 0) {
+        sys3(SYS_kill, split_pid_c, SIGTERM_, 0);
+        for (w = 0; w < 3000 && sys3(SYS_kill, split_pid_c, 0, 0) == 0; w += 20) { sys3(SYS_waitpid, split_pid_c, 0, 1); msleep(20); }   /* 子が 2 本目を閉じ終わるまで(最大 3 秒)。WNOHANG=1 */
+        split_pid_c = 0;
+    }
+}
+static void split_start(int is_sat, unsigned long vpid) {
+    long sv[2], pid;
+    if (sys6(SYS_socketpair, 1, 5, 0, (long)sv, 0, 0) < 0) { split_failed = 1; lgx("raw split: socketpair 失敗", 0); return; }    /* AF_UNIX, SOCK_SEQPACKET */
+    pid = sys3(SYS_fork, 0, 0, 0);
+    if (pid == 0) { sys3(SYS_close, sv[0], 0, 0); split_child(is_sat, vpid, sv[1]); sys3(SYS_exit, 0, 0, 0); }
+    sys3(SYS_close, sv[1], 0, 0);
+    if (pid < 0) { sys3(SYS_close, sv[0], 0, 0); split_failed = 1; return; }
+    sys3(SYS_fcntl, sv[0], 4, 0x80);     /* F_SETFL, O_NONBLOCK(MIPS=0x80) */
+    split_fd = sv[0]; split_pid_c = pid; split_vpid = vpid;
+}
+static void split_drain(void) {          /* 子から届いた映像のパケットを出す(届いていなければすぐ戻る) */
+    for (;;) {
+        long r = sys3(SYS_read, split_fd, (long)split_buf, sizeof(split_buf)), k;
+        if (r == -11) return;            /* EAGAIN: 今は無い */
+        if (r <= 0) { lgx("raw split: 2 本目が終わった。主だけで続ける", 0); split_stop(); split_failed = 1; return; }
+        for (k = 0; k + 188 <= r; k += 188) if (split_buf[k] == 0x47) put_pkt(split_buf + k);
+    }
+}
+
+/* 1 パケットを判定する。出すならそのパケット(PAT は書き換えたもの)、出さないなら 0 */
+static const unsigned char *raw_filter(const unsigned char *q) {
+    unsigned long pid = ((q[1] & 0x1f) << 8) | q[2];
+    if (pid == 0) { feed(q); if (sec_complete(0)) raw_parse_pat(); return raw_rewrite_pat(q); }
+    if (pid == raw_pmt_pid) { feed(q); if (sec_complete(1)) raw_parse_pmt(); }
+    return (pidmap_has(raw_base, pid) || pidmap_has(raw_dyn, pid)) ? q : 0;
+}
+
 /* 1回の選局+受信セッション。http>0 のとき out_fd がソケットで、準備できた時点でHTTPヘッダを送る。戻り値は終了コード */
 static int si_only;		/* HTTP の ?si=1: SI(PAT/NIT/SDT/EIT/TOT 等)だけを出す。B-CAS の ACTIVATE も復号ストリームも使わない(番組表の取得用。視聴中の別系統に影響しない) */
 static int session(int is_sat, unsigned long freq_val, unsigned long ts_id, unsigned long want_sid, unsigned long dur_ms, int ofd, int http) {
@@ -1193,17 +1371,28 @@ again:
         if (http) send_headers(ofd);
         t_start = now_ms();
         lgx("si-only streaming begin", 0);
+        if (dbg_raw && want_sid) { raw_filter_init(want_sid); lgx("raw sid filter", want_sid); }
         while (!stop_flag) {
             unsigned char *p; unsigned long psz, k;
             if (dur_ms && now_ms() - t_start >= dur_ms) break;
             if (recv_pt(200, &p, &psz)) {
                 nt = 0;
-                for (k = 0; k + 188 <= psz; k += 188)
-                    if (p[k] == 0x47 && (dbg_raw || is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2]))) put_pkt(p + k);
+                for (k = 0; k + 188 <= psz; k += 188) {
+                    if (p[k] != 0x47) continue;
+                    if (dbg_raw && want_sid) { const unsigned char *o = raw_filter(p + k); if (o) put_pkt(o); }
+                    else if (dbg_raw || is_si_pid(((p[k + 1] & 0x1f) << 8) | p[k + 2])) put_pkt(p + k);
+                }
+                if (dbg_raw && want_sid && is_sat && !split_failed && raw_vpid && raw_vpid != split_vpid) {   /* 映像の PID が分かった(変わった): 2 本目に分ける */
+                    if (split_pid_c) split_stop();
+                    lgx("raw split: 映像を 2 本目に分ける pid", raw_vpid);
+                    split_start(is_sat, raw_vpid);
+                }
             } else if (++nt > 100) { err("出力が止まった\n"); break; }
+            if (split_fd >= 0) split_drain();
             if (olen) flush_out();
         }
         if (olen) flush_out();
+        split_stop();
         session_want_sid = 0;
         close_streams();
         release_tuner();
@@ -1758,6 +1947,7 @@ static int listen_port(unsigned long port) {
                         else while (*p >= '0' && *p <= '9') { ts_id = ts_id * 10 + (*p - '0'); p++; }
                     } else if (starts(p, "sec=")) { p += 4; while (*p >= '0' && *p <= '9') { sec = sec * 10 + (*p - '0'); p++; } }
                     else if (starts(p, "si=")) { p += 3; si_only = (*p == '1'); while (*p >= '0' && *p <= '9') p++; }
+                    else if (starts(p, "raw=")) { p += 4; if (*p == '1') { dbg_raw = 1; si_only = 1; } while (*p >= '0' && *p <= '9') p++; }  /* ?raw=1: PSI ストリームをスクランブルのまま出す(復号しない)。sid も付けると、そのサービスに要る PID だけに絞る(raw_filter) */
                     else break;
                 }
                 if (!parse_channel_str(ch_buf, &is_sat, &freq_val, &parsed_ts_id)) {
